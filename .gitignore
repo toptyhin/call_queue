@@ -1,0 +1,57 @@
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- Python (apps/api, apps/mocks) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.python-version
+.python-doctor/
+
+# --- Node / frontend (apps/web) ---
+node_modules/
+.pnpm-store/
+dist/
+dist-ssr/
+*.local
+.vite/
+coverage/
+
+# --- Logs / runtime ---
+*.log
+logs/
+tmp/
+.cache/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# --- Docker / local volumes ---
+.docker-data/
+
+# --- Tooling / agents ---
+.cursor/hooks/*.log
+*.tsbuildinfo
+.turbo/
+.eslintcache
