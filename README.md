@@ -32,6 +32,20 @@ docker compose --profile dev up -d
 
 Моки слушают `:8090` и не стартуют без профиля `dev` (чтобы не мешать проверочному стенду).
 
+### Локальный UI (`yarn dev` / `pnpm dev`)
+
+API и БД — в Docker; фронт — на хосте. Vite проксирует `/api`, `/rpc`, `/dev`, `/healthz`, `/webhooks` на `http://localhost:8080` (см. `apps/web/vite.config.ts`, переопределение — `VITE_API_PROXY`).
+
+```bash
+docker compose up -d api db          # при необходимости: docker compose stop web
+cd apps/web
+cp -n .env.example .env              # опционально
+yarn install   # или: pnpm install
+yarn dev       # или: pnpm dev  → http://localhost:5173
+```
+
+Если контейнер `web` уже занял `:5173`, остановите его (`docker compose stop web`) или задайте другой порт Vite.
+
 ## Переменные окружения
 
 Обязательные по контракту (см. `.env.example`):
