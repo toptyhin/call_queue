@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
-import orjson
 import structlog
 
 from app.config import Settings
@@ -23,7 +22,7 @@ async def crm_poller_loop(settings: Settings, stop: asyncio.Event) -> None:
                 log.exception("crm_poller.error")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=settings.crm_poll_interval_sec)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
 
@@ -75,7 +74,7 @@ async def _poll_once(
 
             attempts = int(row["attempts"]) + 1
             delay = min(300.0, backoff_base**attempts)
-            next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            next_at = datetime.now(UTC) + timedelta(seconds=delay)
             await conn.execute(
                 """
                 UPDATE crm_outbox

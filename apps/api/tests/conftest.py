@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -68,7 +69,7 @@ async def admin_conn() -> AsyncIterator[asyncpg.Connection]:
 
 def make_token(org_id: UUID, role: str = "worker", sub: str = "tester") -> str:
     settings = get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return jwt.encode(
         {
             "sub": sub,
@@ -125,7 +126,7 @@ async def seed_contact(
     contact_id = uuid4()
     phone = phone or f"+7900{contact_id.int % 10_000_000:07d}"
     if timezone_name is None:
-        utc_hour = datetime.now(timezone.utc).hour
+        utc_hour = datetime.now(UTC).hour
         offset = (12 - utc_hour) % 24
         if offset == 0:
             tz = "UTC"
@@ -163,7 +164,7 @@ def webhook_payload(
         "call_id": call_id,
         "sequence": sequence,
         "type": type_,
-        "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "data": data or {},
     }
     return orjson.dumps(body)

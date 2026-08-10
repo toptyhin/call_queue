@@ -1,4 +1,4 @@
-.PHONY: up down logs seed codegen test load-seed load-claim load-webhook
+.PHONY: up down logs seed codegen test lint typecheck load-seed load-claim load-webhook
 
 up:
 	docker compose up -d --build
@@ -28,6 +28,12 @@ codegen:
 
 test:
 	cd apps/api && uv run pytest -q
+
+lint:
+	cd apps/api && uv run ruff check .
+
+typecheck:
+	cd apps/api && uv run mypy
 
 load-seed:
 	DATABASE_URL=postgresql://postgres:postgres@localhost:54329/postgres \

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 
 import orjson
 import structlog
@@ -20,7 +19,7 @@ async def reaper_loop(settings: Settings, stop: asyncio.Event) -> None:
             log.exception("reaper.error")
         try:
             await asyncio.wait_for(stop.wait(), timeout=settings.reaper_interval_sec)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 import orjson
@@ -61,7 +61,11 @@ async def link_provider_call(
                 return ProviderLinkResponse(
                     linked=True, provider_call_id=body.provider_call_id
                 )
-            raise AppError(409, "already_linked", "attempt already linked to another provider_call_id")
+            raise AppError(
+                409,
+                "already_linked",
+                "attempt already linked to another provider_call_id",
+            )
 
         # Ensure uniqueness: if another attempt already has this provider_call_id
         conflict = await conn.fetchrow(
@@ -118,7 +122,7 @@ async def abort_call_attempt(
             WHERE id = $1
             """,
             attempt_id,
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             orjson.dumps(outcome).decode(),
         )
 

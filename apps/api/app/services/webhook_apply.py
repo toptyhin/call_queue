@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -166,7 +166,7 @@ async def sweep_buffer(conn: asyncpg.Connection, provider_call_id: str) -> None:
         if isinstance(occurred_raw, str):
             occurred_at = datetime.fromisoformat(occurred_raw.replace("Z", "+00:00"))
         else:
-            occurred_at = datetime.now(timezone.utc)
+            occurred_at = datetime.now(UTC)
         applied = await apply_event_to_attempt(
             conn,
             event_row_id=row["id"],
