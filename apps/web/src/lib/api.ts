@@ -116,38 +116,39 @@ export type CallFeedAnalysisEvent = {
   status: ServerStatus
 }
 
-async function readError(res: Response): Promise<string> {
+/** Machine-readable API error (`{code, detail}`) with a human message. */
+export class ApiError extends Error {
+  readonly code: string | null
+  readonly status: number
+
+  constructor(
+    message: string,
+    opts: { code?: string | null; status: number },
+  ) {
+    super(message)
+    this.name = 'ApiError'
+    this.code = opts.code ?? null
+    this.status = opts.status
+  }
+}
+
+async function readApiError(res: Response): Promise<ApiError> {
+  let code: string | null = null
+  let detail = res.statusText || `HTTP ${res.status}`
   try {
     const body: unknown = await res.json()
-    if (
-      body &&
-      typeof body === 'object' &&
-      'message' in body &&
-      typeof (body as { message: unknown }).message === 'string'
-    ) {
-      return (body as { message: string }).message
+    if (body && typeof body === 'object') {
+      const rec = body as Record<string, unknown>
+      if (typeof rec.code === 'string') code = rec.code
+      if (typeof rec.message === 'string') detail = rec.message
+      else if (typeof rec.detail === 'string') detail = rec.detail
+      else if (code === 'validation_error') detail = 'Некорректный запрос'
+      else detail = `HTTP ${res.status}`
     }
-    if (
-      body &&
-      typeof body === 'object' &&
-      'detail' in body &&
-      typeof (body as { detail: unknown }).detail === 'string'
-    ) {
-      return (body as { detail: string }).detail
-    }
-    if (
-      body &&
-      typeof body === 'object' &&
-      'code' in body &&
-      'detail' in body
-    ) {
-      const detail = (body as { detail: unknown }).detail
-      if (typeof detail === 'string') return detail
-    }
-    return JSON.stringify(body)
   } catch {
-    return res.statusText || `HTTP ${res.status}`
+    /* keep statusText */
   }
+  return new ApiError(detail, { code, status: res.status })
 }
 
 export async function mintDevToken(
@@ -158,31 +159,43 @@ export async function mintDevToken(
     headers: JSON_HEADERS,
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as { token: string }
 }
 
 export async function logoutDevToken(): Promise<void> {
   const res = await apiFetch('/dev/logout', { method: 'POST' })
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
 }
 
 export async function getDevSession(): Promise<DevSession> {
   const res = await apiFetch('/dev/session')
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as DevSession
 }
 
-export async function listCallAttempts(opts?: {
+export type ListCallAttemptsOpts = {
   limit?: number
   cursor?: string | null
-}): Promise<CallAttemptListResponse> {
+  status?: CallAttemptStatus
+  phone?: string
+  createdFrom?: string
+  createdTo?: string
+}
+
+export async function listCallAttempts(
+  opts?: ListCallAttemptsOpts,
+): Promise<CallAttemptListResponse> {
   const params = new URLSearchParams()
   if (opts?.limit) params.set('limit', String(opts.limit))
   if (opts?.cursor) params.set('cursor', opts.cursor)
+  if (opts?.status) params.set('status', opts.status)
+  if (opts?.phone) params.set('phone', opts.phone)
+  if (opts?.createdFrom) params.set('created_from', opts.createdFrom)
+  if (opts?.createdTo) params.set('created_to', opts.createdTo)
   const qs = params.toString()
   const res = await apiFetch(`/api/call_attempts${qs ? `?${qs}` : ''}`)
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as CallAttemptListResponse
 }
 
@@ -190,7 +203,7 @@ export async function getCallAttempt(
   attemptId: string,
 ): Promise<CallAttemptDetail> {
   const res = await apiFetch(`/api/call_attempts/${attemptId}`)
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as CallAttemptDetail
 }
 
@@ -202,13 +215,13 @@ export async function createAnalysis(
     headers: JSON_HEADERS,
     body: JSON.stringify({ call_attempt_id: callAttemptId }),
   })
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as AnalysisCreated
 }
 
 export async function getAnalysis(analysisId: string): Promise<Analysis> {
   const res = await apiFetch(`/api/analyses/${analysisId}`)
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as Analysis
 }
 
@@ -218,6 +231,6 @@ export async function cancelAnalysis(
   const res = await apiFetch(`/api/analyses/${analysisId}/cancel`, {
     method: 'POST',
   })
-  if (!res.ok) throw new Error(await readError(res))
+  if (!res.ok) throw await readApiError(res)
   return (await res.json()) as { id: string; status: 'cancelled' }
 }

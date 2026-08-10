@@ -5,18 +5,6 @@ import { CallsPanel } from './components/CallsPanel'
 import { DevTokenForm } from './components/DevTokenForm'
 import { getDevSession, type DevSession } from './lib/api'
 import { useAnalysisStream } from './lib/useAnalysisStream'
-import type { UiState } from './lib/uiState'
-
-const STATE_BADGE: Record<UiState, string> = {
-  idle: 'bg-slate-200 text-slate-800',
-  queued: 'bg-amber-200 text-amber-900',
-  streaming: 'bg-sky-200 text-sky-900',
-  reconnecting: 'bg-orange-200 text-orange-900',
-  done: 'bg-emerald-200 text-emerald-900',
-  partial: 'bg-violet-200 text-violet-900',
-  error: 'bg-red-200 text-red-900',
-  cancelled: 'bg-zinc-300 text-zinc-800',
-}
 
 export default function App() {
   const [session, setSession] = useState<DevSession | null>(null)
@@ -52,6 +40,14 @@ export default function App() {
     }
   }, [])
 
+  function selectCallAttempt(id: string) {
+    if (id !== callAttemptId) {
+      stream.reset()
+      setShellError(null)
+    }
+    setCallAttemptId(id)
+  }
+
   const actionError = shellError ?? stream.actionError
 
   return (
@@ -62,14 +58,8 @@ export default function App() {
       <div className="mx-auto max-w-4xl space-y-6 p-6">
         <header className="flex flex-wrap items-center justify-between gap-3">
           <h1 className="text-2xl font-semibold tracking-tight">
-            Calls & analysis
+            Звонки и разбор
           </h1>
-          <span
-            className={`rounded px-2 py-1 text-xs font-mono uppercase tracking-wide ${STATE_BADGE[stream.uiState]}`}
-            title="data-state"
-          >
-            data-state: {stream.uiState}
-          </span>
         </header>
 
         <DevTokenForm
@@ -85,32 +75,58 @@ export default function App() {
         {authenticated ? (
           <CallsPanel
             selectedId={callAttemptId || null}
-            onSelect={(id) => setCallAttemptId(id)}
-          />
+            onSelect={(id) => selectCallAttempt(id ?? '')}
+          >
+            {({
+              attemptStatus,
+              hasCompletedAnalysis,
+              analysesKnown,
+              completedDisplay,
+            }) => {
+              const uiState =
+                hasCompletedAnalysis && stream.uiState === 'idle'
+                  ? 'done'
+                  : stream.uiState
+              const serverStatus =
+                hasCompletedAnalysis && stream.serverStatus == null
+                  ? 'done'
+                  : stream.serverStatus
+              return (
+                <>
+                  <AnalysisPanel
+                    embedded
+                    callAttemptId={callAttemptId}
+                    onCallAttemptIdChange={selectCallAttempt}
+                    attemptStatus={attemptStatus}
+                    hasCompletedAnalysis={hasCompletedAnalysis}
+                    analysesKnown={analysesKnown}
+                    uiState={uiState}
+                    analysisId={stream.analysisId}
+                    serverStatus={serverStatus}
+                    connectionStatus={stream.connectionStatus}
+                    lastEventId={stream.lastEventId}
+                    busy={stream.busy}
+                    authenticated={authenticated}
+                    actionError={actionError}
+                    errorMessage={stream.errorMessage}
+                    onStart={() => {
+                      setShellError(null)
+                      void stream.start(callAttemptId)
+                    }}
+                    onCancel={() => {
+                      setShellError(null)
+                      void stream.cancel()
+                    }}
+                  />
+                  <AnalysisResultView
+                    embedded
+                    display={stream.display ?? completedDisplay}
+                  />
+                </>
+              )
+            }}
+          </CallsPanel>
         ) : null}
-
-        <AnalysisPanel
-          callAttemptId={callAttemptId}
-          onCallAttemptIdChange={setCallAttemptId}
-          analysisId={stream.analysisId}
-          serverStatus={stream.serverStatus}
-          connectionStatus={stream.connectionStatus}
-          lastEventId={stream.lastEventId}
-          busy={stream.busy}
-          authenticated={authenticated}
-          actionError={actionError}
-          errorMessage={stream.errorMessage}
-          onStart={() => {
-            setShellError(null)
-            void stream.start(callAttemptId)
-          }}
-          onCancel={() => {
-            setShellError(null)
-            void stream.cancel()
-          }}
-        />
-
-        <AnalysisResultView display={stream.display} />
       </div>
     </div>
   )

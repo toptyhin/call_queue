@@ -65,7 +65,7 @@ export function DevTokenForm({
   return (
     <section className="space-y-3 rounded border border-slate-200 bg-white p-4">
       <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-        Dev token
+        Dev-токен
       </h2>
       <form onSubmit={handleMintToken} className="grid gap-3 sm:grid-cols-2">
         <label className="block text-sm">
@@ -92,7 +92,7 @@ export function DevTokenForm({
             disabled={busy || sessionLoading}
             className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-40"
           >
-            Mint token
+            Выпустить токен
           </button>
           {authenticated ? (
             <button
@@ -101,19 +101,19 @@ export function DevTokenForm({
               disabled={busy}
               className="rounded border border-slate-300 bg-white px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-40"
             >
-              Logout
+              Выйти
             </button>
           ) : null}
           <span className="text-xs text-slate-500">
-            role: authenticated · HttpOnly cookie `dev_token`
+            роль: authenticated · HttpOnly cookie `dev_token`
           </span>
         </div>
       </form>
       {sessionLoading ? (
-        <p className="text-sm text-slate-500">Checking session…</p>
+        <p className="text-sm text-slate-500">Проверка сессии…</p>
       ) : authenticated ? (
         <p className="rounded bg-emerald-50 p-2 text-sm text-emerald-900">
-          Cookie set
+          Cookie установлен
           {session?.sub ? (
             <span className="ml-2 font-mono text-xs text-emerald-800">
               sub={session.sub}
@@ -122,7 +122,7 @@ export function DevTokenForm({
           ) : null}
         </p>
       ) : (
-        <p className="text-sm text-slate-500">No session cookie yet</p>
+        <p className="text-sm text-slate-500">Cookie сессии ещё нет</p>
       )}
     </section>
   )

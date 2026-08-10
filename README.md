@@ -69,7 +69,7 @@ Compose также задаёт DSN БД, пароли ролей `app_user` / `
 **Часть 2 — разбор звонка**
 - `POST /api/analyses`, SSE `GET /api/analyses/:id/stream` (`Last-Event-ID`), cancel
 - Стрим-консюмер к провайдеру, журнал чанков в БД, partial-результат
-- Web UI с `data-state` на контейнере (queued / streaming / reconnecting / done / partial / error / cancelled / idle)
+- Web UI с `data-state` на контейнере страницы и на секции разбора внутри выбранной карточки (queued / streaming / reconnecting / done / partial / error / cancelled / idle)
 
 **UI-расширение (сверх ТЗ §7.4)**
 - `GET /api/call_attempts` — список попыток org; клик в UI открывает детали
@@ -105,8 +105,8 @@ curl -s -b cookies.txt -c cookies.txt -X POST http://localhost:8080/dev/logout
 
 1. **Claim** — после `make seed`: `POST /rpc/claim_next_contact` с JWT и `campaign_id` из сида → контакт + `attempt_id` (или `contact: null`, если очередь пуста / кампания не `active`).
 2. **Webhook** — `POST /webhooks/calls` с валидной `X-Signature: sha256=…` по сырому телу; невалидная подпись → `401`. События до `provider-link` буферизуются (`200`), после линка применяются по `sequence`.
-3. **Analysis stream** — `docker compose --profile dev up -d`, сид, JWT, `POST /api/analyses` с `call_attempt_id` completed-попытки → SSE до `done`; UI на `:5173` показывает `data-state`.
-4. **Calls list UI** — на `:5173` mint token (`authenticated`) → список звонков; клик по строке → таймлайн (`queued`/`dialing`/`in_progress`/терминал), блоки LLM и CRM; live-обновления через `/api/call_attempts/stream`.
+3. **Analysis stream** — `docker compose --profile dev up -d`, сид, JWT, `POST /api/analyses` с `call_attempt_id` completed-попытки → SSE до `done`; UI на `:5173` показывает бейдж `data-state` внутри карточки разбора.
+4. **Calls list UI** — на `:5173` mint token (`authenticated`) → список звонков; клик по строке → таймлайн (`queued`/`dialing`/`in_progress`/терминал), блоки LLM и CRM; live-обновления через `/api/call_attempts/stream`. Кнопка «Запустить разбор» активна только для `completed`.
 5. **E2E flow** — полный прогон контакт → телефония (в т.ч. буфер/дедуп/out-of-order/401) → CRM-ретраи → LLM (`CHAOS_429` / `CHAOS_BREAK` / `CHAOS_INVALID` / cancel):
 
 ```bash

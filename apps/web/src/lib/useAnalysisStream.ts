@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchEventSource } from '@microsoft/fetch-event-source'
 import type { AnalysisResult, PartialAnalysisResult } from '../generated/analysis-result'
 import {
+  ApiError,
   cancelAnalysis,
   createAnalysis,
   getAnalysis,
 } from './api'
+import { formatAnalysisError } from './formatError'
 import {
   buffersFromPartial,
   emptyBuffers,
@@ -18,6 +20,20 @@ import {
   type ServerStatus,
   type UiState,
 } from './uiState'
+
+const ANALYSIS_ACTION_ERROR_RU: Record<string, string> = {
+  attempt_not_completed: 'Разбор доступен только для завершённых звонков',
+  no_transcript: 'Звонок завершился без транскрипта — разбор невозможен',
+  analysis_terminal: 'Разбор уже завершён или отменён',
+  not_found: 'Попытка не найдена',
+}
+
+function analysisActionMessage(err: unknown): string {
+  if (err instanceof ApiError && err.code && ANALYSIS_ACTION_ERROR_RU[err.code]) {
+    return ANALYSIS_ACTION_ERROR_RU[err.code]
+  }
+  return err instanceof Error ? err.message : String(err)
+}
 
 const MAX_RECONNECT_FAILURES = 5
 const DEFAULT_RETRY_MS = 3000
@@ -34,6 +50,8 @@ export type AnalysisStream = {
   busy: boolean
   start: (callAttemptId: string) => Promise<void>
   cancel: () => Promise<void>
+  /** Drop local stream state (call from the selection-change event handler). */
+  reset: () => void
   clearActionError: () => void
 }
 
@@ -101,7 +119,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
         buffersRef.current = buffersFromPartial(analysis.partial)
         setPartial(analysis.partial)
       }
-      if (analysis.error) setErrorMessage(analysis.error)
+      if (analysis.error) setErrorMessage(formatAnalysisError(analysis.error))
       if (
         analysis.status === 'done' ||
         analysis.status === 'error' ||
@@ -142,7 +160,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
           }
           return
         }
-        throw new Error(`SSE open failed: HTTP ${response.status}`)
+        throw new Error(`Не удалось открыть SSE: HTTP ${response.status}`)
       },
       onmessage(ev) {
         if (ev.event === 'chunk') {
@@ -187,9 +205,11 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
           setServerStatus('error')
           try {
             const data = JSON.parse(ev.data) as { message?: string }
-            if (data.message) setErrorMessage(data.message)
+            if (data.message) {
+              setErrorMessage(formatAnalysisError(data.message) ?? data.message)
+            }
           } catch {
-            setErrorMessage(ev.data || 'stream error')
+            setErrorMessage(ev.data || 'ошибка стрима')
           }
           stopStream()
         }
@@ -208,7 +228,9 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
                 ? prev
                 : 'error',
             )
-            setErrorMessage('Stream closed unexpectedly; keeping partial')
+            setErrorMessage(
+              'Стрим неожиданно закрыт; частичный результат сохранён',
+            )
           }
         })
       },
@@ -224,7 +246,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
             prev === 'done' || prev === 'cancelled' ? prev : 'error',
           )
           setErrorMessage(
-            `Reconnect failed after ${MAX_RECONNECT_FAILURES} attempts; keeping partial`,
+            `Не удалось переподключиться после ${MAX_RECONNECT_FAILURES} попыток; частичный результат сохранён`,
           )
           throw err
         }
@@ -234,19 +256,10 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
     })
   }
 
-  async function start(callAttemptId: string) {
-    setActionError(null)
-    setErrorMessage(null)
-    if (!authenticated) {
-      setActionError('Mint a dev token first')
-      return
-    }
-    if (!callAttemptId.trim()) {
-      setActionError('call_attempt_id is required')
-      return
-    }
-
+  function resetLocalState() {
     stopStream()
+    terminalRef.current = false
+    reconnectFailuresRef.current = 0
     buffersRef.current = emptyBuffers()
     lastEventIdRef.current = null
     setLastEventId(null)
@@ -256,6 +269,23 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
     setConnectionStatus('idle')
     setAnalysisId(null)
     setServerStatus(null)
+    setErrorMessage(null)
+    setActionError(null)
+  }
+
+  async function start(callAttemptId: string) {
+    setActionError(null)
+    setErrorMessage(null)
+    if (!authenticated) {
+      setActionError('Сначала выпустите dev-токен')
+      return
+    }
+    if (!callAttemptId.trim()) {
+      setActionError('Укажите call_attempt_id')
+      return
+    }
+
+    resetLocalState()
 
     try {
       const created = await createAnalysis(callAttemptId.trim())
@@ -263,7 +293,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
       setServerStatus(created.status)
       connectStream(created.id)
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      setActionError(analysisActionMessage(err))
       setServerStatus(null)
     }
   }
@@ -279,7 +309,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
       setConnectionStatus('closed')
       stopStream()
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      setActionError(analysisActionMessage(err))
     }
   }
 
@@ -303,6 +333,7 @@ export function useAnalysisStream(authenticated: boolean): AnalysisStream {
     busy,
     start,
     cancel,
+    reset: resetLocalState,
     clearActionError: () => setActionError(null),
   }
 }
