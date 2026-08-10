@@ -22,6 +22,7 @@
 apps/api/        FastAPI: эндпоинты, миграции (migrations/*.sql), фоновые задачи (CRM-поллер, reaper, стрим-консюмеры)
 apps/web/        React + Vite + Tailwind: страница разбора, data-state на контейнере
 apps/mocks/      Мок LLM-провайдера (контракт ТЗ 7.1) и мок CRM; compose-профиль dev
+spec/            OpenAPI-контракты: api.openapi.yaml (наш API), provider.openapi.yaml (ТЗ 7.1 для мока)
 packages/shared/ analysis-result.schema.json + кодогенерация моделей
 docker-compose.yml, .env(.example), Makefile, README.md, ASSUMPTIONS.md, AI-USAGE.md
 ```
@@ -36,6 +37,7 @@ docker-compose.yml, .env(.example), Makefile, README.md, ASSUMPTIONS.md, AI-USAG
 - **JWT, роли, RLS** → §7. По умолчанию: стенд подписывает токены сам; `POST /dev/token` — только за dev-флагом.
 - **Анализы, SSE, LLM-провайдер** → §9. По умолчанию: чанки пишутся в `analysis_chunks`, переподключение с `Last-Event-ID` дочитывает из БД, генерация не перезапускается.
 - **Запуск, env, моки, сиды** → §10. По умолчанию: сиды только вручную (`make seed`), моки только в профиле `dev`.
+- **Эндпоинты, коды ответов, payload'ы** → сначала `spec/api.openapi.yaml` (контракт рекорда). Новый эндпоинт или изменение контракта = правка спеки до реализации, в том же коммите.
 
 ## Ведение AI-USAGE.md
 

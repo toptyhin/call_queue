@@ -1,0 +1,99 @@
+openapi: 3.1.0
+info:
+  title: LLM Provider Contract (ТЗ 7.1)
+  version: 0.1.0
+  description: |
+    Контракт вышестоящего LLM-провайдера разбора звонков.
+
+    При проверке подставляется реализация стенда (`PROVIDER_URL` из `.env`);
+    для разработки контракт реализует мок `apps/mocks`.
+
+    Гарантии провайдера минимальны, потребитель обязан переживать:
+    - `429` с заголовком `Retry-After` (секунды) — ретрай по указанному времени;
+    - обрыв соединения в середине потока — ретрай с бэкоффом;
+    - финальный `done`, не соответствующий схеме результата, — валидация на нашей стороне,
+      невалидный результат → `error` анализа с сохранением partial.
+
+servers:
+  - url: http://localhost:8090
+    description: Мок разработки (apps/mocks, compose-профиль dev)
+
+paths:
+  /v1/analyze:
+    post:
+      operationId: analyze
+      summary: Запустить стриминговый разбор транскрипта
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, transcript]
+              additionalProperties: false
+              properties:
+                request_id:
+                  type: string
+                  minLength: 1
+                  description: correlation-id вызова; у нас = id анализа
+                transcript:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: SSE-поток чанков, завершается событием `done`
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                stream_sample:
+                  value: |
+                    event: chunk
+                    data: {"field":"summary","delta":"Клиент интерес"}
+
+                    event: chunk
+                    data: {"field":"summary","delta":"овался в тарифах"}
+
+                    event: done
+                    data: {"result":{"summary":"Клиент интересовался тарифами","objections":["дорого"],"next_step":"send_proposal","lead_score":62,"confidence":0.81}}
+        '429':
+          description: Rate limit; повторить через `Retry-After` секунд
+          headers:
+            Retry-After:
+              required: true
+              description: Задержка перед повтором, секунды
+              schema:
+                type: integer
+                minimum: 1
+
+components:
+  schemas:
+    ChunkData:
+      type: object
+      required: [field, delta]
+      description: >-
+        Правило склейки: дельты одного поля конкатенируются как текст в порядке
+        следования чанков. Строковые поля (`summary`) — текст как есть;
+        `objections`, `lead_score`, `confidence` стримятся как JSON-представление
+        значения (например, `lead_score`: `"6"` + `"2"` → `62`; `objections` —
+        текст массива `["дорого"]`). Поле считается накопленным, когда его текст
+        валидно парсится.
+      properties:
+        field:
+          type: string
+          enum: [summary, objections, next_step, lead_score, confidence]
+          description: имя поля результата, к которому относится дельта
+        delta:
+          type: string
+          description: фрагмент текстового представления значения поля
+    DoneData:
+      type: object
+      required: [result]
+      description: >-
+        Терминальное событие. `result` обязан соответствовать схеме 7.3, но
+        потребитель не доверяет этому: валидирует сам, невалидный результат →
+        `error` анализа с сохранением partial.
+      properties:
+        result:
+          $ref: '../packages/shared/analysis-result.schema.json'

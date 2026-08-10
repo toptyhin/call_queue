@@ -1,0 +1,810 @@
+openapi: 3.1.0
+info:
+  title: Call Campaign Service API
+  version: 0.1.0
+  description: |
+    HTTP-контракт сервиса управления обзвоном (тестовое задание).
+
+    Контракт запуска: `docker compose up -d` из корня → API на `http://localhost:8080`,
+    `GET /healthz` → `200`, PostgreSQL на `localhost:54329`.
+
+    ## Аутентификация и роли
+    - JWT HS256, заголовок `Authorization: Bearer <jwt>`, claims: `sub`, `org_id`, `role`
+      (`worker` — сервисные воркеры, `authenticated` — пользователи веб-приложения).
+      Стенд подписывает токены сам нашим `JWT_SECRET`; выдача токенов — за пределами сервиса.
+    - Вебхуки провайдера: HMAC-SHA256 от сырого тела запроса с ключом `WEBHOOK_SECRET`,
+      заголовок `X-Signature: sha256=<hex>`.
+    - Изоляция организаций — PostgreSQL RLS: чужой ресурс отвечает `404`, а не `403`.
+    - Матрица ролей (дублируется в `x-roles` каждой операции): `claim_next_contact` — обе
+      роли; `provider-link`/`abort` — только `worker`; `/api/analyses*` — обе роли.
+      Недопущенная роль → `403` `forbidden` (роль — не изоляция, поэтому не `404`).
+
+    ## Семантика ошибок
+    - Все ошибки — `Error` с машиночитаемым `code` (enum `ErrorCode`) и человекочитаемым
+      `detail`. Клиенты и стенд опираются на `code`, а не на текст.
+    - `401` — `unauthorized` (нет/невалидный JWT), `token_expired`, `invalid_signature`.
+    - `403` — `forbidden` (роль не допущена к операции).
+    - `404` — `not_found`: ресурс не найден **или принадлежит другой организации**.
+    - `409` — конфликт жизненного цикла: `already_linked`, `not_queued`,
+      `no_transcript`, `attempt_not_completed`, `analysis_terminal`.
+    - `422` — `validation_error` (тело не прошло схему; `detail` — массив ошибок FastAPI).
+
+    ## Идемпотентность и ретраи
+    | Операция | Ретрай безопасен | Естественный ключ / поведение |
+    |---|---|---|
+    | `POST /webhooks/calls` | да | `event_id`: дедуп, повтор → `200` |
+    | `POST .../provider-link` | да | `provider_call_id`: тот же → `200`, чужой → `409` |
+    | `POST .../abort` | да | повтор невозможен: попытка уже не `queued` → `409` |
+    | `POST /rpc/claim_next_contact` | нет | каждый вызов может выдать следующий контакт |
+    | `POST /api/analyses` | создаёт новый разбор | дедупликации по `call_attempt_id` нет (переанализ легитимен) |
+    | `POST .../cancel` | да | повторная отмена → `200` |
+    | `GET *` | да | read-only |
+
+    ## Корреляция
+    Все ответы включают заголовок `x-request-id`: эхо клиентского, если прислан,
+    иначе сгенерированный. Вебхук дополнительно логируется со сквозным
+    `provider_event_id` до записи в БД.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный стенд (docker compose)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Проверки живости
+  - name: rpc
+    description: Точки вызова DB-функций (PostgREST-стиль; бизнес-логика — в функциях БД)
+  - name: webhooks
+    description: Приём событий провайдера телефонии
+  - name: call-attempts
+    description: Воркерское API попыток звонка
+  - name: analyses
+    description: 'Разбор звонка: стриминг результата LLM (часть 2 ТЗ)'
+  - name: dev
+    description: Только для разработки, за флагом окружения
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthz
+      summary: Liveness probe
+      description: >-
+        Чистый liveness — `200`, если HTTP-сервер жив. Готовность обеспечивается
+        порядком старта: сначала БД и миграции, потом открытие порта.
+      security: []
+      responses:
+        '200':
+          description: Сервис жив
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /rpc/claim_next_contact:
+    post:
+      tags: [rpc]
+      operationId: claimNextContact
+      x-roles: [worker, authenticated]
+      summary: Забрать следующий контакт кампании
+      description: |
+        Тонкий HTTP-адаптер над DB-функцией `claim_next_contact`; HTTP-слой только
+        аутентифицирует и проксирует. Роли `worker` и `authenticated` равноправны.
+
+        Контакт выдаётся, только если выполнено всё:
+        1. кампания в статусе `active`;
+        2. `do_not_call = false`;
+        3. `attempts_count < 3`;
+        4. локальное время контакта (его IANA-таймзона) в интервале `[09:00, 20:00)`;
+        5. с `last_attempt_at` прошло ≥ 4 часов (или попыток ещё не было);
+        6. контакт не заблокирован другой активной попыткой.
+
+        При выдаче создаётся `call_attempts` со статусом `queued`; её id возвращается
+        как `attempt_id`. Контакт не выдаётся повторно, пока попытка не перешла
+        в терминальный статус. Неизвестная или чужая кампания → `404` `not_found`
+        (`contact: null` — только про отсутствие подходящих контактов).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimNextContactRequest'
+      responses:
+        '200':
+          description: 'Контакт выдан либо подходящих нет (`contact: null` — не ошибка)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimNextContactResponse'
+              examples:
+                contact_found:
+                  value:
+                    contact:
+                      id: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+                      phone_e164: "+79001112233"
+                      attempt_id: 9b2f4c3a-1d2e-4f5a-8b9c-0d1e2f3a4b5c
+                contact_none:
+                  value:
+                    contact: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 'Кампания не найдена или принадлежит другой организации (`code: not_found`)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /webhooks/calls:
+    post:
+      tags: [webhooks]
+      operationId: receiveCallWebhook
+      summary: Событие провайдера телефонии
+      security:
+        - webhookSignature: []
+      description: |
+        Доставка at-least-once: провайдер ретраит при ответе не-2xx или таймауте 2 с.
+
+        Семантика ответов: **любое валидно подписанное событие → `200`**, включая:
+        - повторную доставку (дедупликация по `event_id`);
+        - событие по неизвестному `call_id` (сохраняется в буфер, применится при привязке);
+        - устаревшее по `sequence` или пришедшее после терминального статуса
+          (сохраняется, не применяется).
+
+        Маппинг типа на целевой статус `call_attempts`:
+        `call.queued` → `queued` · `call.dialing` → `dialing` · `call.answered` → `in_progress` ·
+        `call.completed` → `completed` · `call.failed` → `failed` · `call.no_answer` → `no_answer`.
+
+        **Неизвестный `type` — не ошибка**: событие сохраняется в `webhook_events`,
+        отвечаем `200`, к попытке не применяется. Отвечать `422` на неизвестный тип нельзя —
+        провайдер будет ретраить вечно (poison message).
+
+        Правила применения к `call_attempts` (связь по `provider_call_id`):
+        - событие применяется, только если `sequence` строго больше последнего применённого;
+        - терминальные статусы (`completed`, `failed`, `no_answer`) односторонни;
+        - `data.attempt_id` (uuid) — client reference для fallback-привязки попытки,
+          если `provider_call_id` ещё не зарегистрирован воркером;
+        - `call.answered` заполняет `started_at`; терминальные типы — `ended_at` и `outcome`
+          (в `outcome` кладётся объект `data` целиком); `data.transcript` сохраняется
+          в `call_attempts.transcript`.
+
+        Приём ≤ 1 с p99 при 50 rps; внешние системы из request-path не вызываются.
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 от сырого тела запроса
+          schema:
+            type: string
+            pattern: '^sha256=[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEvent'
+      responses:
+        '200':
+          description: Событие принято (см. семантику выше)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAccepted'
+        '401':
+          description: Невалидная подпись; тело не обрабатывается, в БД ничего не пишется
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/call_attempts/{attempt_id}/provider-link:
+    post:
+      tags: [call-attempts]
+      operationId: linkProviderCall
+      x-roles: [worker]
+      summary: Привязать provider_call_id к попытке
+      description: |
+        Воркер регистрирует `provider_call_id` сразу после старта звонка у провайдера.
+        Идемпотентно: повтор с тем же значением → `200`.
+
+        В той же транзакции «подметается» буфер: все события этого `provider_call_id`,
+        принятые до привязки, применяются в порядке `sequence`.
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderLinkRequest'
+      responses:
+        '200':
+          description: Привязано (или уже было привязано к этому же id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderLinkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Попытка уже привязана к другому `provider_call_id` (`code: already_linked`)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/call_attempts/{attempt_id}/abort:
+    post:
+      tags: [call-attempts]
+      operationId: abortCallAttempt
+      x-roles: [worker]
+      summary: Терминировать нестартовавшую попытку
+      description: |
+        Воркер вызывает при синхронном отказе провайдера (вебхуков не будет никогда).
+        Допустимо только из статуса `queued`. Попытка переходит в `failed`, далее
+        стандартный терминальный триггер: `attempts_count + 1`, разблокировка контакта,
+        запись в `crm_outbox`.
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AbortRequest'
+      responses:
+        '200':
+          description: Попытка терминирована
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallAttemptMutationResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Попытка не в статусе `queued` (`code: not_queued`; уже у провайдера или терминальна)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/analyses:
+    post:
+      tags: [analyses]
+      operationId: createAnalysis
+      x-roles: [authenticated, worker]
+      summary: Запустить разбор звонка
+      description: |
+        Транскрипт берётся из `call_attempts.transcript` (заполняется из
+        `data.transcript` события `call.completed`). Запуск возможен только для
+        завершённой попытки с непустым транскриптом.
+
+        Повторный вызов на ту же попытку создаёт **новый** разбор (`200` с новым `id`) —
+        переанализ легитимен, дедупликации по `call_attempt_id` нет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAnalysisRequest'
+      responses:
+        '200':
+          description: Разбор поставлен в очередь
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisCreated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`code`: `attempt_not_completed` (попытка не завершена) или `no_transcript` (транскрипт пуст)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/analyses/{analysis_id}:
+    get:
+      tags: [analyses]
+      operationId: getAnalysis
+      x-roles: [authenticated, worker]
+      summary: Текущее состояние и накопленный результат
+      parameters:
+        - $ref: '#/components/parameters/AnalysisId'
+      responses:
+        '200':
+          description: Состояние разбора; `result` — только после валидации по схеме 7.3
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Analysis'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/analyses/{analysis_id}/stream:
+    get:
+      tags: [analyses]
+      operationId: streamAnalysis
+      x-roles: [authenticated, worker]
+      summary: SSE-поток разбора
+      description: |
+        События: `chunk` (SSE-поле `id:` = монотонный seq чанка), `done`, `error`.
+
+        Переподключение с заголовком `Last-Event-ID` дочитывает чанки из журнала в БД
+        (`id > Last-Event-ID`), затем подписывается на живой поток. Генерация при
+        переподключении **не перезапускается**.
+
+        `EventSource` не умеет произвольные заголовки — клиент использует fetch-based SSE
+        (например, `@microsoft/fetch-event-source`) с заголовком `Authorization`.
+
+        Механика потока:
+        - первая строка потока — `retry: 3000` (рекомендуемая задержка переподключения, мс);
+        - heartbeat: комментарий `: ping` каждые 15 с молчания, чтобы прокси/браузер
+          не рвали соединение;
+        - SSE-поле `id:` несут только события `chunk` (монотонный seq); `done`/`error` —
+          терминальные, без `id`;
+        - подключение к уже терминальному анализу (`done`/`error`/`cancelled`): сервер
+          отдаёт журнал чанков (с учётом `Last-Event-ID`), затем терминальное событие
+          и закрывает поток;
+        - дисконнект клиента ≠ отмена: генерация продолжается, отмена — только
+          через `POST .../cancel`;
+        - конкурентные подключения к одному анализу разрешены (поток read-only).
+
+        Клиентские производные состояния (`reconnecting`, `partial`) вычисляются из
+        серверного `status` и состояния соединения: серверный enum их не содержит.
+      parameters:
+        - $ref: '#/components/parameters/AnalysisId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: seq последнего полученного чанка; сервер дошлёт все новее из журнала
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Поток событий до терминального `done`/`error`
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Грамматика SSE; у `chunk` SSE-поле id обязательно
+              examples:
+                stream_sample:
+                  value: |
+                    retry: 3000
+
+                    : ping
+
+                    id: 41
+                    event: chunk
+                    data: {"field":"summary","delta":"Клиент интерес"}
+
+                    id: 42
+                    event: chunk
+                    data: {"field":"summary","delta":"овался в тарифах"}
+
+                    event: done
+                    data: {"result":{"summary":"Клиент интересовался тарифами","objections":["дорого"],"next_step":"send_proposal","lead_score":62,"confidence":0.81}}
+
+                    event: error
+                    data: {"message":"provider stream broken, retries exhausted"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/analyses/{analysis_id}/cancel:
+    post:
+      tags: [analyses]
+      operationId: cancelAnalysis
+      x-roles: [authenticated, worker]
+      summary: Отменить разбор
+      description: |
+        Идемпотентно: `queued`/`streaming` → `cancelled`; повторная отмена → `200`.
+        Завершённые (`done`/`error`) отменить нельзя → `409`.
+      parameters:
+        - $ref: '#/components/parameters/AnalysisId'
+      responses:
+        '200':
+          description: Разбор отменён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisCancelled'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Разбор уже в терминальном статусе `done`/`error` (`code: analysis_terminal`)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /dev/token:
+    post:
+      tags: [dev]
+      operationId: mintDevToken
+      summary: Выпустить JWT (только разработка)
+      description: Доступен только при `DEV_TOKEN_ENABLED=true`, иначе `404`. При проверке стенд подписывает токены сам — эндпоинт не участвует в контракте стенда.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DevTokenRequest'
+      responses:
+        '200':
+          description: Подписанный JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DevTokenResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 JWT, claims `sub`, `org_id`, `role`
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: "`sha256=` + hex(HMAC-SHA256(raw body, WEBHOOK_SECRET))"
+
+  parameters:
+    AttemptId:
+      name: attempt_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    AnalysisId:
+      name: analysis_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+  headers:
+    XRequestId:
+      description: Correlation-id запроса; эхо клиентского `x-request-id` или сгенерированный
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: '`code`: `unauthorized` (нет/невалидный JWT) или `token_expired`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: 'Роль не допущена к операции (`code: forbidden`)'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 'Не найдено или принадлежит другой организации (`code: not_found`)'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: 'Тело запроса не соответствует схеме (`code: validation_error`)'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+
+    ErrorCode:
+      type: string
+      description: Машиночитаемый код ошибки; опираться на него, а не на `detail`
+      enum:
+        - unauthorized
+        - token_expired
+        - invalid_signature
+        - forbidden
+        - not_found
+        - already_linked
+        - not_queued
+        - no_transcript
+        - attempt_not_completed
+        - analysis_terminal
+        - validation_error
+
+    Error:
+      type: object
+      required: [code, detail]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        detail:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+              description: массив ошибок FastAPI при code=validation_error
+
+    ClaimNextContactRequest:
+      type: object
+      required: [campaign_id]
+      additionalProperties: false
+      properties:
+        campaign_id:
+          $ref: '#/components/schemas/Uuid'
+
+    ClaimedContact:
+      type: object
+      required: [id, phone_e164, attempt_id]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        phone_e164:
+          type: string
+          pattern: '^\+[1-9]\d{1,14}$'
+        attempt_id:
+          $ref: '#/components/schemas/Uuid'
+
+    ClaimNextContactResponse:
+      type: object
+      required: [contact]
+      properties:
+        contact:
+          anyOf:
+            - $ref: '#/components/schemas/ClaimedContact'
+            - type: 'null'
+
+    KnownWebhookEventType:
+      type: string
+      enum: [call.queued, call.dialing, call.answered, call.completed, call.failed, call.no_answer]
+      description: >-
+        Справочник известных типов (для моков и кодогена). Входной `WebhookEvent.type`
+        намеренно НЕ ограничен этим enum — см. политику неизвестных типов в операции.
+
+    WebhookEvent:
+      type: object
+      required: [event_id, call_id, sequence, type, occurred_at, data]
+      additionalProperties: false
+      properties:
+        event_id:
+          type: string
+          minLength: 1
+          description: уникальный id события у провайдера; ключ дедупликации
+        call_id:
+          type: string
+          minLength: 1
+          description: id звонка у провайдера; матчится на call_attempts.provider_call_id
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: монотонно возрастает и уникален в пределах call_id
+        type:
+          type: string
+          minLength: 1
+          description: >-
+            Известные значения — в справочнике `KnownWebhookEventType`. Поле намеренно
+            свободное: неизвестный тип принимается (`200`), сохраняется, не применяется.
+        occurred_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          description: |
+            Полезная нагрузка события. Известные поля:
+            `attempt_id` (uuid) — client reference для fallback-привязки;
+            `transcript` (string) — в `call.completed`;
+            `do_not_call` (true) — выставляет `contacts.do_not_call`.
+            Целиком сохраняется в `call_attempts.outcome` при терминальном статусе.
+
+    WebhookAccepted:
+      type: object
+      required: [received]
+      properties:
+        received:
+          type: boolean
+          example: true
+
+    ProviderLinkRequest:
+      type: object
+      required: [provider_call_id]
+      additionalProperties: false
+      properties:
+        provider_call_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+
+    ProviderLinkResponse:
+      type: object
+      required: [linked, provider_call_id]
+      properties:
+        linked:
+          type: boolean
+          example: true
+        provider_call_id:
+          type: string
+
+    AbortRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: машиночитаемая причина, сохраняется в outcome
+
+    CallAttemptMutationResult:
+      type: object
+      required: [id, status]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          example: failed
+
+    CreateAnalysisRequest:
+      type: object
+      required: [call_attempt_id]
+      additionalProperties: false
+      properties:
+        call_attempt_id:
+          $ref: '#/components/schemas/Uuid'
+
+    AnalysisCreated:
+      type: object
+      required: [id, status]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [queued]
+
+    AnalysisCancelled:
+      type: object
+      required: [id, status]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [cancelled]
+
+    AnalysisStatus:
+      type: string
+      enum: [queued, streaming, done, error, cancelled]
+      description: Серверный статус; `reconnecting`/`partial` из ТЗ 7.4 — клиентские производные
+
+    PartialAnalysisResult:
+      type: object
+      description: >-
+        Накопленный частичный результат: та же форма, что у схемы 7.3
+        (`packages/shared/analysis-result.schema.json`), но все поля необязательны.
+        Правило склейки: дельты чанков одного поля конкатенируются как текст;
+        строковые поля — это сам текст, а `objections`/`lead_score`/`confidence`
+        стримятся как JSON-представление значения. Поле появляется в `partial`,
+        когда его накопленный текст успешно парсится.
+      additionalProperties: false
+      properties:
+        summary:
+          type: string
+        objections:
+          type: array
+          items:
+            type: string
+        next_step:
+          type: string
+          enum: [call_back, send_proposal, disqualify, escalate]
+        lead_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+
+    Analysis:
+      type: object
+      required: [id, call_attempt_id, status, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        call_attempt_id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/AnalysisStatus'
+        result:
+          anyOf:
+            - $ref: '../packages/shared/analysis-result.schema.json'
+            - type: 'null'
+          description: финальный результат, прошедший валидацию схемы 7.3; null до done
+        partial:
+          anyOf:
+            - $ref: '#/components/schemas/PartialAnalysisResult'
+            - type: 'null'
+          description: накопленный частичный результат (сохраняется при обрыве/ошибке/отмене)
+        error:
+          anyOf:
+            - type: string
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+
+    DevTokenRequest:
+      type: object
+      required: [sub, org_id, role]
+      additionalProperties: false
+      properties:
+        sub:
+          type: string
+          minLength: 1
+        org_id:
+          $ref: '#/components/schemas/Uuid'
+        role:
+          type: string
+          enum: [worker, authenticated]
+        expires_in:
+          type: integer
+          minimum: 60
+          default: 86400
+          description: TTL токена в секундах
+
+    DevTokenResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
