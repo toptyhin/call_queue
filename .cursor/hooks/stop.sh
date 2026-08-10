@@ -15,13 +15,24 @@ emit_json() {
   fi
 }
 
-# True when doctor output reports real findings (not a clean scan).
-has_doctor_findings() {
+# True when doctor output has hard failures worth interrupting the agent.
+# Warnings (⚠) alone are not actionable follow-ups — they re-loop forever
+# after "reviewed, N/A" dispositions. Critical = ✖ / Security failures / non-zero exit.
+has_critical_doctor_findings() {
   local report="$1"
   if printf '%s\n' "$report" | grep -qiE 'No issues found!'; then
     return 1
   fi
-  printf '%s\n' "$report" | grep -qE '(^|[[:space:]])(✖|⚠|All [1-9][0-9]* issues)'
+  # Hard failure marker from react-doctor / similar tools.
+  if printf '%s\n' "$report" | grep -qE '(^|[[:space:]])✖'; then
+    return 0
+  fi
+  # python-doctor: Security category not clean.
+  if printf '%s\n' "$report" | grep -qiE 'Security \([0-9]+/[0-9]+\)' \
+    && ! printf '%s\n' "$report" | grep -qiE 'Security \([0-9]+/[0-9]+\) ✓'; then
+    return 0
+  fi
+  return 1
 }
 
 input=$(cat)
@@ -75,11 +86,11 @@ if echo "$changed_files" | grep -qE "$frontend_pattern"; then
     doctor_out=$(printf '%s\n' "$doctor_out" | grep -vE '^npm warn ' | head -n 80 || true)
     if [ "$rd_code" -eq 124 ]; then
       log "Stop hook: react-doctor timed out, skipping."
-    elif has_doctor_findings "$doctor_out" || { [ "$rd_code" -ne 0 ] && printf '%s' "$doctor_out" | grep -qiE 'error|✖'; }; then
+    elif [ "$rd_code" -ne 0 ] || has_critical_doctor_findings "$doctor_out"; then
       reports+=("react-doctor (exit $rd_code):
 $doctor_out")
     else
-      log "Stop hook: react-doctor clean, no follow-up."
+      log "Stop hook: react-doctor warnings-only or clean, no follow-up."
     fi
   else
     log "Stop hook: npx not available, skipping react-doctor."
@@ -102,11 +113,11 @@ if echo "$changed_files" | grep -qE '\.py$'; then
     doctor_out=$(printf '%s\n' "$doctor_out" | head -n 80 || true)
     if [ "$pd_code" -eq 124 ]; then
       log "Stop hook: python-doctor timed out, skipping."
-    elif [ "$pd_code" -ne 0 ] || has_doctor_findings "$doctor_out"; then
+    elif [ "$pd_code" -ne 0 ] || has_critical_doctor_findings "$doctor_out"; then
       reports+=("python-doctor (exit $pd_code):
 $doctor_out")
     else
-      log "Stop hook: python-doctor clean, no follow-up."
+      log "Stop hook: python-doctor warnings-only or clean, no follow-up."
     fi
   else
     log "Stop hook: python-doctor not available (install: pipx install python-doctor), skipping."
