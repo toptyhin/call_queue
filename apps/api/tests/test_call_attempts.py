@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -163,6 +164,193 @@ async def test_list_invalid_cursor(client: AsyncClient, admin_conn) -> None:
     )
     assert r.status_code == 422
     assert r.json()["code"] == "validation_error"
+
+
+@pytest.mark.asyncio
+async def test_list_filter_by_status(client: AsyncClient, admin_conn) -> None:
+    org_id = _fresh_org()
+    campaign_id = await seed_org_campaign(admin_conn, org_id=org_id)
+    await seed_contact(admin_conn, org_id=org_id, campaign_id=campaign_id)
+    await seed_contact(admin_conn, org_id=org_id, campaign_id=campaign_id)
+    done = await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+    queued = await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+    await _complete_attempt(client, org_id=org_id, attempt_id=done)
+
+    token = make_token(org_id, "authenticated")
+    r = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"status": "completed"},
+    )
+    assert r.status_code == 200
+    ids = {item["id"] for item in r.json()["items"]}
+    assert ids == {done}
+    assert all(item["status"] == "completed" for item in r.json()["items"])
+
+    r_queued = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"status": "queued"},
+    )
+    assert r_queued.status_code == 200
+    assert {item["id"] for item in r_queued.json()["items"]} == {queued}
+
+
+@pytest.mark.asyncio
+async def test_list_filter_by_phone_prefix(client: AsyncClient, admin_conn) -> None:
+    org_id = _fresh_org()
+    campaign_id = await seed_org_campaign(admin_conn, org_id=org_id)
+    await seed_contact(
+        admin_conn, org_id=org_id, campaign_id=campaign_id, phone="+74951234567"
+    )
+    await seed_contact(
+        admin_conn, org_id=org_id, campaign_id=campaign_id, phone="+79001112233"
+    )
+    await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+    await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+
+    token = make_token(org_id, "authenticated")
+    with_plus = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"phone": "+7495"},
+    )
+    assert with_plus.status_code == 200
+    items = with_plus.json()["items"]
+    assert len(items) == 1
+    assert items[0]["phone"] == "+74951234567"
+
+    # Prefix without '+' does not match E.164 stored with leading '+'.
+    digits = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"phone": "7495"},
+    )
+    assert digits.status_code == 200
+    assert digits.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_filter_by_created_range(client: AsyncClient, admin_conn) -> None:
+    org_id = _fresh_org()
+    campaign_id = await seed_org_campaign(admin_conn, org_id=org_id)
+    await seed_contact(admin_conn, org_id=org_id, campaign_id=campaign_id)
+    await seed_contact(admin_conn, org_id=org_id, campaign_id=campaign_id)
+    older = await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+    newer = await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+
+    t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    t1 = t0 + timedelta(hours=1)
+    t2 = t0 + timedelta(hours=2)
+    await admin_conn.execute(
+        "UPDATE call_attempts SET created_at = $1 WHERE id = $2::uuid",
+        t0,
+        older,
+    )
+    await admin_conn.execute(
+        "UPDATE call_attempts SET created_at = $1 WHERE id = $2::uuid",
+        t1,
+        newer,
+    )
+
+    token = make_token(org_id, "authenticated")
+    # Inclusive lower, exclusive upper: [t0, t1) → only older.
+    mid = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "created_from": t0.isoformat(),
+            "created_to": t1.isoformat(),
+        },
+    )
+    assert mid.status_code == 200
+    assert {item["id"] for item in mid.json()["items"]} == {older}
+
+    wide = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "created_from": t0.isoformat(),
+            "created_to": t2.isoformat(),
+        },
+    )
+    assert wide.status_code == 200
+    assert {item["id"] for item in wide.json()["items"]} == {older, newer}
+
+
+@pytest.mark.asyncio
+async def test_list_filters_with_cursor(client: AsyncClient, admin_conn) -> None:
+    org_id = _fresh_org()
+    campaign_id = await seed_org_campaign(admin_conn, org_id=org_id)
+    phones = ["+74950000001", "+74950000002", "+79001110001"]
+    for phone in phones:
+        await seed_contact(
+            admin_conn, org_id=org_id, campaign_id=campaign_id, phone=phone
+        )
+    attempts = [
+        await _claim_attempt(client, org_id=org_id, campaign_id=campaign_id)
+        for _ in phones
+    ]
+    for attempt_id in attempts:
+        await _complete_attempt(client, org_id=org_id, attempt_id=attempt_id)
+
+    token = make_token(org_id, "authenticated")
+    page1 = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"status": "completed", "phone": "+7495", "limit": 1},
+    )
+    assert page1.status_code == 200
+    body1 = page1.json()
+    assert len(body1["items"]) == 1
+    assert body1["next_cursor"]
+    assert body1["items"][0]["phone"].startswith("+7495")
+
+    page2 = await client.get(
+        "/api/call_attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "status": "completed",
+            "phone": "+7495",
+            "limit": 1,
+            "cursor": body1["next_cursor"],
+        },
+    )
+    assert page2.status_code == 200
+    body2 = page2.json()
+    assert len(body2["items"]) == 1
+    assert body2["next_cursor"] is None
+    assert body2["items"][0]["id"] != body1["items"][0]["id"]
+    assert body2["items"][0]["phone"].startswith("+7495")
+    matched = {body1["items"][0]["id"], body2["items"][0]["id"]}
+    assert len(matched) == 2
+    assert all(aid in set(attempts) for aid in matched)
+
+
+@pytest.mark.asyncio
+async def test_list_invalid_filter_params(client: AsyncClient, admin_conn) -> None:
+    org_id = _fresh_org()
+    await seed_org_campaign(admin_conn, org_id=org_id)
+    token = make_token(org_id, "authenticated")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    bad_status = await client.get(
+        "/api/call_attempts", headers=headers, params={"status": "unknown"}
+    )
+    assert bad_status.status_code == 422
+    assert bad_status.json()["code"] == "validation_error"
+
+    bad_phone = await client.get(
+        "/api/call_attempts", headers=headers, params={"phone": "%7900"}
+    )
+    assert bad_phone.status_code == 422
+    assert bad_phone.json()["code"] == "validation_error"
+
+    letters = await client.get(
+        "/api/call_attempts", headers=headers, params={"phone": "abc"}
+    )
+    assert letters.status_code == 422
+    assert letters.json()["code"] == "validation_error"
 
 
 @pytest.mark.asyncio

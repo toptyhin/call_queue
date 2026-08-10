@@ -54,6 +54,63 @@ def list_item_from_row(row: asyncpg.Record) -> dict[str, Any]:
     }
 
 
+_LIST_PAGE_SQL = """
+SELECT
+    a.id, a.status, a.started_at, a.ended_at, a.created_at,
+    c.phone_e164 AS phone,
+    camp.name AS campaign_name
+FROM call_attempts a
+JOIN contacts c ON c.id = a.contact_id
+JOIN campaigns camp ON camp.id = a.campaign_id
+WHERE ($1::text IS NULL OR a.status = $1)
+  AND ($2::text IS NULL OR c.phone_e164 LIKE $2 || '%')
+  AND ($3::timestamptz IS NULL OR a.created_at >= $3)
+  AND ($4::timestamptz IS NULL OR a.created_at < $4)
+  AND (
+      $5::timestamptz IS NULL
+      OR (a.created_at, a.id) < ($5::timestamptz, $6::uuid)
+  )
+ORDER BY a.created_at DESC, a.id DESC
+LIMIT $7
+"""
+
+
+async def fetch_list_page(
+    conn: asyncpg.Connection,
+    *,
+    limit: int,
+    cursor: tuple[datetime, UUID] | None = None,
+    status: str | None = None,
+    phone: str | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Cursor page of call attempts with optional AND filters."""
+    cursor_ts: datetime | None = None
+    cursor_id: UUID | None = None
+    if cursor is not None:
+        cursor_ts, cursor_id = cursor
+
+    rows = await conn.fetch(
+        _LIST_PAGE_SQL,
+        status,
+        phone,
+        created_from,
+        created_to,
+        cursor_ts,
+        cursor_id,
+        limit + 1,
+    )
+
+    page_rows = rows[:limit]
+    items = [list_item_from_row(r) for r in page_rows]
+    next_cursor: str | None = None
+    if len(rows) > limit and page_rows:
+        last = page_rows[-1]
+        next_cursor = encode_cursor(last["created_at"], last["id"])
+    return items, next_cursor
+
+
 def crm_from_row(row: asyncpg.Record | None) -> dict[str, Any] | None:
     if row is None:
         return None

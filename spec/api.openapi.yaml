@@ -224,6 +224,10 @@ paths:
       description: |
         Курсорная пагинация по `(created_at DESC, id DESC)`. Возвращает только
         попытки org из JWT (RLS). Расширение сверх ТЗ для веб-UI.
+
+        Опциональные фильтры комбинируются по AND и совместимы с курсором
+        (порядок сортировки не меняется). Невалидные значения → `422`
+        `validation_error`.
       parameters:
         - name: limit
           in: query
@@ -240,6 +244,37 @@ paths:
           schema:
             type: string
             minLength: 1
+        - name: status
+          in: query
+          required: false
+          description: Точное совпадение со статусом попытки
+          schema:
+            $ref: '#/components/schemas/CallAttemptStatus'
+        - name: phone
+          in: query
+          required: false
+          description: >
+            Префикс `contacts.phone_e164` (LIKE prefix). Паттерн защищает
+            от LIKE-метасимволов `%`/`_`.
+          schema:
+            type: string
+            pattern: '^\+?[0-9]{1,15}$'
+            minLength: 1
+            maxLength: 16
+        - name: created_from
+          in: query
+          required: false
+          description: Нижняя граница включительно — `created_at >= created_from`
+          schema:
+            type: string
+            format: date-time
+        - name: created_to
+          in: query
+          required: false
+          description: Верхняя граница исключительно — `created_at < created_to`
+          schema:
+            type: string
+            format: date-time
       responses:
         '200':
           description: Страница списка
@@ -251,6 +286,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
 
   /api/call_attempts/stream:
     get:

@@ -105,9 +105,9 @@
 
 ТЗ (§7.4) требует одну страницу запуска разбора и живой просмотр с `data-state`. Дополнительно (не оценивается стендом, но контрактуется в OpenAPI):
 
-- `GET /api/call_attempts` — курсорный список попыток org (`created_at DESC`); роль `authenticated`.
+- `GET /api/call_attempts` — курсорный список попыток org (`created_at DESC, id DESC`); роль `authenticated`. Опциональные серверные фильтры (AND): `status` (exact), `phone` (префикс `contacts.phone_e164`, pattern `^\+?[0-9]{1,15}$`), `created_from` / `created_to` (`created_at >= from`, `created_at < to`). Совместимы с курсором. Отдельные индексы под фильтры не вводим: объём — per-org срез RLS, сортировка/курсор закрыты `idx_call_attempts_org_created`.
 - `GET /api/call_attempts/{id}` — детали: контакт/кампания, `status_history`, связанные `analyses`, состояние CRM outbox.
-- `GET /api/call_attempts/stream` — org SSE: события `attempt` / `crm` / `analysis` (LISTEN/NOTIFY + re-read под RLS; механика как у analyses: `retry: 3000`, `: ping`).
+- `GET /api/call_attempts/stream` — org SSE: события `attempt` / `crm` / `analysis` (LISTEN/NOTIFY + re-read под RLS; механика как у analyses: `retry: 3000`, `: ping`). Клиент применяет live-`attempt` к списку только если элемент матчит активные фильтры (иначе удаляет из текущего среза).
 
 **История статусов звонка** строится без отдельного журнала: синтетическая точка `queued` (`source=claim` от `call_attempts.created_at`) + применённые `webhook_events` (маппинг типов ТЗ → статусы) + точка `abort`, если попытка `failed` без терминального вебхука.
 

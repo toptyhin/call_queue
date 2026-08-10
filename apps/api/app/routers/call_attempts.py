@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import binascii
+import re
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -16,9 +17,8 @@ from app.db import db
 from app.errors import AppError
 from app.services.call_attempt_read import (
     decode_cursor,
-    encode_cursor,
     fetch_detail,
-    list_item_from_row,
+    fetch_list_page,
 )
 from app.sse import call_attempts_event_stream
 
@@ -27,6 +27,11 @@ router = APIRouter(tags=["call-attempts"])
 AuthenticatedPrincipal = Annotated[
     Principal, Depends(require_roles("authenticated"))
 ]
+
+CALL_ATTEMPT_STATUSES = frozenset(
+    {"queued", "dialing", "in_progress", "completed", "failed", "no_answer"}
+)
+PHONE_PREFIX_RE = re.compile(r"^\+?[0-9]{1,15}$")
 
 
 class CallAttemptListItem(BaseModel):
@@ -95,58 +100,38 @@ async def list_call_attempts(
     principal: AuthenticatedPrincipal,
     limit: int = Query(default=50, ge=1, le=100),
     cursor: str | None = Query(default=None, min_length=1),
+    status: str | None = Query(default=None, min_length=1),
+    phone: str | None = Query(default=None, min_length=1, max_length=16),
+    created_from: datetime | None = Query(default=None),
+    created_to: datetime | None = Query(default=None),
 ) -> CallAttemptListResponse:
-    cursor_ts: datetime | None = None
-    cursor_id: UUID | None = None
+    cursor_key: tuple[datetime, UUID] | None = None
     if cursor:
         try:
-            cursor_ts, cursor_id = decode_cursor(cursor)
+            cursor_key = decode_cursor(cursor)
         except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
             raise AppError(422, "validation_error", "invalid cursor") from exc
 
+    if status is not None and status not in CALL_ATTEMPT_STATUSES:
+        raise AppError(422, "validation_error", "invalid status")
+    if phone is not None and PHONE_PREFIX_RE.fullmatch(phone) is None:
+        raise AppError(422, "validation_error", "invalid phone prefix")
+
     async with db.tenant_connection(principal.org_id) as conn:
-        if cursor_ts is not None and cursor_id is not None:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    a.id, a.status, a.started_at, a.ended_at, a.created_at,
-                    c.phone_e164 AS phone,
-                    camp.name AS campaign_name
-                FROM call_attempts a
-                JOIN contacts c ON c.id = a.contact_id
-                JOIN campaigns camp ON camp.id = a.campaign_id
-                WHERE (a.created_at, a.id) < ($1::timestamptz, $2::uuid)
-                ORDER BY a.created_at DESC, a.id DESC
-                LIMIT $3
-                """,
-                cursor_ts,
-                cursor_id,
-                limit + 1,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    a.id, a.status, a.started_at, a.ended_at, a.created_at,
-                    c.phone_e164 AS phone,
-                    camp.name AS campaign_name
-                FROM call_attempts a
-                JOIN contacts c ON c.id = a.contact_id
-                JOIN campaigns camp ON camp.id = a.campaign_id
-                ORDER BY a.created_at DESC, a.id DESC
-                LIMIT $1
-                """,
-                limit + 1,
-            )
+        items, next_cursor = await fetch_list_page(
+            conn,
+            limit=limit,
+            cursor=cursor_key,
+            status=status,
+            phone=phone,
+            created_from=created_from,
+            created_to=created_to,
+        )
 
-    page_rows = rows[:limit]
-    items = [CallAttemptListItem(**list_item_from_row(r)) for r in page_rows]
-    next_cursor = None
-    if len(rows) > limit and page_rows:
-        last = page_rows[-1]
-        next_cursor = encode_cursor(last["created_at"], last["id"])
-
-    return CallAttemptListResponse(items=items, next_cursor=next_cursor)
+    return CallAttemptListResponse(
+        items=[CallAttemptListItem(**item) for item in items],
+        next_cursor=next_cursor,
+    )
 
 
 @router.get("/api/call_attempts/stream")
