@@ -14,7 +14,7 @@ from app.errors import AppError, app_error_handler, http_error_handler, validati
 from app.logging import get_logger, setup_logging
 from app.middleware import RequestIdMiddleware
 from app.migrations import apply_migrations
-from app.routers import dev, rpc
+from app.routers import attempts, dev, rpc, webhooks
 
 log = get_logger(__name__)
 
@@ -58,6 +58,8 @@ app.add_exception_handler(StarletteHTTPException, http_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
 
 app.include_router(rpc.router)
+app.include_router(webhooks.router)
+app.include_router(attempts.router)
 app.include_router(dev.router)
 
 
