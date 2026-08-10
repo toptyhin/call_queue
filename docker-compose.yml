@@ -37,5 +37,22 @@ services:
       db:
         condition: service_healthy
 
+  web:
+    build:
+      context: ./apps/web
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_PROXY: http://api:8080
+    depends_on:
+      - api
+
+  mocks:
+    profiles: ["dev"]
+    build:
+      context: ./apps/mocks
+    ports:
+      - "8090:8090"
+
 volumes:
   pgdata:

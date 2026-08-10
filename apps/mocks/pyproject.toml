@@ -1,0 +1,17 @@
+[project]
+name = "call-mocks"
+version = "0.1.0"
+description = "Dev mocks for LLM provider (ТЗ 7.1) and CRM"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mocks"]
