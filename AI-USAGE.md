@@ -12,6 +12,13 @@
 | Cursor + Grok 4.5 (агент) | Закрытие python-doctor Structure: hygiene-файлы, ruff/mypy, тесты read-API call_attempts |
 | Cursor + Grok 4.5 (агент) | Рефакторинг Zen/Complexity: stream_consumer, sse, webhooks, buffers_to_partial |
 | Cursor + Grok 4.5 (агент) | react-doctor web → green: HttpOnly cookie auth, сплит App, pnpm hardening |
+| Cursor + Grok 4.5 (агент) | Серверные фильтры + «Load more» для списка call_attempts (OpenAPI → API → UI) |
+| Cursor + Grok 4.5 (агент) | Локализация веб-UI на русский (лейблы, кнопки, статусы, ошибки стрима) |
+| Cursor + Grok 4.5 (агент) | UI: детали звонка и разбор под выбранной строкой списка (slide-down) |
+| Cursor + Grok 4.5 (агент) | Vite proxy на Docker API для локального `yarn`/`pnpm` dev |
+| Cursor + Grok 4.5 (агент) | `scripts/e2e_flow.py` + CRM-мок `__fail_n`/`/_chaos`; перенос бейджа `data-state` в карточку; дружелюбные 409 разбора |
+| Cursor + Grok 4.5 (агент) | Санитизация клиентских ошибок: без дампа Pydantic/HTTP-тел на фронт |
+| Cursor + Grok 4.5 (агент) | UI: не предлагать «Запустить разбор», если у попытки уже есть `done` |
 
 ## 2. Принято без правок
 
@@ -22,16 +29,25 @@
 - После первой проверки SSE: `orjson` не сериализовал `asyncpg UUID` в `event: attempt` — в `list_item_from_row` id/даты приводятся к `str`/`isoformat` до dump.
 - Hygiene для python-doctor Structure: `apps/api/README.md`, `.gitignore`, MIT `LICENSE` (корень + `apps/api`), пустой `app/py.typed` — без правок после генерации.
 - Конфиг `[tool.ruff]` / `[tool.mypy]` в `apps/api/pyproject.toml` и цели `make lint` / `make typecheck` — по плану; auto-fix ruff (UP017/`datetime.UTC`, unused imports) принят как есть.
+- Фильтры list call_attempts: query `status`/`phone`/`created_from`/`created_to` в OpenAPI + `fetch_list_page` (динамический WHERE) + UI (debounce телефона, Load more, SSE-гард по фильтрам) — по утверждённому плану; без новых миграций/индексов.
+- Локализация `apps/web` на русский: заголовки/кнопки/пустоты/ошибки стрима и отображаемые статусы (call/CRM/LLM/feed); значения API и `data-state` оставлены англ.
+- Раскрытие деталей/разбора под выбранной строкой `CallsPanel` (`SlideDown` через `grid-template-rows`, `embedded` у `AnalysisPanel` / `AnalysisResultView`, toggle повторным кликом) — по запросу; enter-only анимация (без exit, чтобы не дублировать children при смене строки).
+- Vite `server.proxy` → Docker `:8080` (`loadEnv` + `VITE_API_PROXY`, SSE `timeout: 0`); `apps/web/.env.example` и README-секция локального `yarn`/`pnpm` dev.
+- Каркас `scripts/e2e_flow.py` (claim → webhooks → CRM → analyses, хаос LLM/телефонии) и Makefile `e2e-flow` — по утверждённому плану; top-up контактов через asyncpg.
 
 ## 3. Переписано после генерации
 
+- **CRM mock chaos** (`apps/mocks/mocks/crm.py`) — первая версия `__fail_n` в теле фейлила каждый вызов; переписано на per-`attempt_id` бюджет + глобальный `/crm/_chaos` + `/crm/_debug/calls`.
+- **UI `data-state` / ошибки разбора** — бейдж из header `App.tsx` перенесён в `AnalysisPanel` (атрибут дублируется на секции); `ApiError` сохраняет `code` из `{code,detail}`, маппинг 409 → русские сообщения; кнопка старта disabled при статусе ≠ `completed`.
+- **UI повторный разбор** — кнопка старта скрыта при `analyses[].status === 'done'` или `serverStatus === 'done'`; `useAnalysisStream.reset` при смене выбранного звонка, чтобы чужой `done` не блокировал другой attempt.
+- **Клиентские тексты ошибок** — `analyses.error` / CRM `last_error` / webhook 422 / FastAPI `RequestValidationError` пишут короткие стабильные коды; детали исключений только в structlog. Фронт: `formatError.ts` (RU для известных кодов + обрезка legacy pydantic-дампа), `readApiError` не делает `JSON.stringify` тела 422.
 - **Webhook apply pipeline** (`webhook_apply.py` + router) — единый конвейер: advisory lock → дедуп → матч/fallback-link → sequence/terminal-гарды → UPDATE; первая генерация смешивала ответственность и обходила буфер.
 - **Claim SQL** — фильтры, `SKIP LOCKED`, inactive campaign → пустой результат; HTTP-слой только мапит `P0002` в 404.
 - **RLS policies** — FORCE RLS, `webhook_events` через linked attempt, `crm_outbox` deny для `app_user`, `app_webhook` BYPASSRLS.
 - **Stream consumer prefix-skip** — при reconnect пропускаются первые K сохранённых чанков с проверкой префикса; mismatch → error, partial сохраняется.
 - **Middleware** — чистый ASGI (correlation-id / request-id), не `BaseHTTPMiddleware` (проблемы со стримингом/телом).
 - **Pytest** — отдельный asyncpg pool на event loop (`pool-per-loop` в conftest), иначе гонки/закрытые loop между тестами.
-- **`tests/test_call_attempts.py`** — черновик агента; после ревью: per-test `uuid4()` org (иначе leftover rows ломают empty/pagination), убраны несуществующие фильтры status/campaign (их нет в роутере), роли строго `authenticated` vs `worker` → 403.
+- **`tests/test_call_attempts.py`** — черновик агента; после ревью: per-test `uuid4()` org (иначе leftover rows ломают empty/pagination), роли строго `authenticated` vs `worker` → 403; позже добавлены фильтры списка (status/phone/created_range) и проверки 422.
 - **mypy vs Starlette handlers** — `add_exception_handler` в `main.py` помечен `# type: ignore[arg-type]` (Protocol ждёт `Exception`, handlers принимают конкретный subclass); лишний ignore в `auth.py` снят.
 - **ruff exclude** — `app/generated` вынесен из lint (codegen руками не правим); для Structure-детекции достаточно секции `[tool.ruff]` в pyproject.
 - **Zen/Complexity рефакторинг (без смены поведения)**:
@@ -54,11 +70,12 @@
 
 ## 5. Как проверялось
 
-- `make test` — 9 pytest-тестов ядра в `test_core.py` (healthz, claim/lock, foreign campaign 404, webhook signature/dedup/buffer/link, terminal+outbox, sequence/terminal guards, abort/provider-link) плюс тесты анализов (`test_analyses.py`), read-API (`test_call_attempts.py`: list/cursor, detail/history/crm, RLS isolation, роли) и cookie-auth (`test_dev_cookie_auth.py`: Set-Cookie/session/logout). После Structure-фикса + cookie: `21 passed, 1 skipped`.
+- `make test` — 9 pytest-тестов ядра в `test_core.py` (healthz, claim/lock, foreign campaign 404, webhook signature/dedup/buffer/link, terminal+outbox, sequence/terminal guards, abort/provider-link) плюс тесты анализов (`test_analyses.py`), read-API (`test_call_attempts.py`: list/cursor, фильтры status/phone/created_range + cursor+filters, 422 на мусор, detail/history/crm, RLS isolation, роли) и cookie-auth (`test_dev_cookie_auth.py`: Set-Cookie/session/logout). После фильтров списка: `test_call_attempts.py` — 14 passed.
 - `uv run ruff check .` / `uv run mypy` в `apps/api` — чисто; после Zen/Complexity-рефакторинга `uvx python-doctor apps/api` → **100/100** (все категории ✓, включая Zen 15/15 и Complexity 15/15).
 - `docker compose up -d` → `GET /healthz` → `200`.
 - E2E разбора против моков: create → SSE → `done`; число вызовов мок-провайдера = 1 (генерация не перезапускается при reconnect клиента).
-- Web: атрибут `data-state` на контейнере присутствует и отражает приоритет состояний UI.
+- `make e2e-flow` против `docker compose --profile dev`: happy / webhook-chaos / LLM 429·break·invalid / CRM `__fail_n` / validation 409 / cancel.
+- Web: атрибут `data-state` на контейнере страницы и секции разбора; бейдж внутри карточки; disabled+подсказка для не-completed.
 - `cd apps/web && pnpm build` / `pnpm lint` — зелёные; `npx react-doctor@latest -y` → **No issues found!** (score API в среде агента недоступен; findings = 0).
 - Нагрузка на 2 млн контактов: claim p95 ≈ 17 мс (цель ≤ 100); webhook 50 rps / 60 с — p99 ≈ 5.5 мс, 0 ошибок (цель ≤ 1 с).
 
