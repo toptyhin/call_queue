@@ -9,14 +9,17 @@ info:
     `GET /healthz` → `200`, PostgreSQL на `localhost:54329`.
 
     ## Аутентификация и роли
-    - JWT HS256, заголовок `Authorization: Bearer <jwt>`, claims: `sub`, `org_id`, `role`
+    - JWT HS256, claims: `sub`, `org_id`, `role`
       (`worker` — сервисные воркеры, `authenticated` — пользователи веб-приложения).
+      Принимается либо заголовок `Authorization: Bearer <jwt>` (воркеры / API-клиенты),
+      либо HttpOnly cookie `dev_token` (веб-UI после `POST /dev/token`).
       Стенд подписывает токены сам нашим `JWT_SECRET`; выдача токенов — за пределами сервиса.
     - Вебхуки провайдера: HMAC-SHA256 от сырого тела запроса с ключом `WEBHOOK_SECRET`,
       заголовок `X-Signature: sha256=<hex>`.
     - Изоляция организаций — PostgreSQL RLS: чужой ресурс отвечает `404`, а не `403`.
     - Матрица ролей (дублируется в `x-roles` каждой операции): `claim_next_contact` — обе
-      роли; `provider-link`/`abort` — только `worker`; `/api/analyses*` — обе роли.
+      роли; `provider-link`/`abort` — только `worker`; `GET /api/call_attempts*` (list/detail/stream)
+      — `authenticated`; `/api/analyses*` — обе роли.
       Недопущенная роль → `403` `forbidden` (роль — не изоляция, поэтому не `404`).
 
     ## Семантика ошибок
@@ -60,7 +63,9 @@ tags:
   - name: webhooks
     description: Приём событий провайдера телефонии
   - name: call-attempts
-    description: Воркерское API попыток звонка
+    description: >-
+      Попытки звонка: воркерские мутации и read-модель для веб-UI
+      (список, детали с таймлайном, SSE статусов)
   - name: analyses
     description: 'Разбор звонка: стриминг результата LLM (часть 2 ТЗ)'
   - name: dev
@@ -208,6 +213,107 @@ paths:
                 $ref: '#/components/schemas/Error'
         '422':
           $ref: '#/components/responses/ValidationError'
+
+  /api/call_attempts:
+    get:
+      tags: [call-attempts]
+      operationId: listCallAttempts
+      x-roles: [authenticated]
+      summary: Список попыток звонка организации
+      description: |
+        Курсорная пагинация по `(created_at DESC, id DESC)`. Возвращает только
+        попытки org из JWT (RLS). Расширение сверх ТЗ для веб-UI.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозрачный курсор из `next_cursor` предыдущего ответа
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Страница списка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallAttemptListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/call_attempts/stream:
+    get:
+      tags: [call-attempts]
+      operationId: streamCallAttempts
+      x-roles: [authenticated]
+      summary: SSE-лента изменений статусов попыток org
+      description: |
+        Live-обновления для списка/деталей. События:
+
+        - `attempt` — изменился статус попытки; data = `CallAttemptListItem`
+        - `crm` — изменилась доставка в CRM; data = `{ "attempt_id", "crm" }`
+        - `analysis` — изменился статус LLM-разбора; data =
+          `{ "attempt_id", "analysis_id", "status" }`
+
+        Механика (как у `/api/analyses/:id/stream`):
+        - первая строка — `retry: 3000`;
+        - heartbeat `: ping` каждые 15 с молчания;
+        - notify — только wake-up; payload берётся повторным SELECT под RLS;
+        - клиент — fetch-based SSE с `Authorization` или cookie `dev_token`
+          (не `EventSource`).
+
+        Расширение сверх ТЗ для веб-UI.
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/call_attempts/{attempt_id}:
+    get:
+      tags: [call-attempts]
+      operationId: getCallAttempt
+      x-roles: [authenticated]
+      summary: Детали попытки со статусной историей, LLM и CRM
+      description: |
+        Таймлайн `status_history`: синтетическая точка `queued` при claim
+        (`source=claim`) + применённые webhook-события (`source=webhook`,
+        типы ТЗ → статусы) + точка `abort` при терминировании без вебхуков
+        (`source=abort`). Плюс связанные `analyses` и состояние `crm` outbox
+        (null, пока терминальный статус не поставил запись в outbox).
+
+        Чужая org → `404`. Расширение сверх ТЗ для веб-UI.
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: Детали попытки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallAttemptDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /api/call_attempts/{attempt_id}/provider-link:
     post:
@@ -365,7 +471,7 @@ paths:
         переподключении **не перезапускается**.
 
         `EventSource` не умеет произвольные заголовки — клиент использует fetch-based SSE
-        (например, `@microsoft/fetch-event-source`) с заголовком `Authorization`.
+        (например, `@microsoft/fetch-event-source`) с `Authorization` или cookie `dev_token`.
 
         Механика потока:
         - первая строка потока — `retry: 3000` (рекомендуемая задержка переподключения, мс);
@@ -457,7 +563,11 @@ paths:
       tags: [dev]
       operationId: mintDevToken
       summary: Выпустить JWT (только разработка)
-      description: Доступен только при `DEV_TOKEN_ENABLED=true`, иначе `404`. При проверке стенд подписывает токены сам — эндпоинт не участвует в контракте стенда.
+      description: |
+        Доступен только при `DEV_TOKEN_ENABLED=true`, иначе `404`.
+        Ответ содержит JWT в теле и выставляет HttpOnly cookie `dev_token`
+        (`SameSite=Lax`, `Path=/`; `Secure` — при `COOKIE_SECURE=true`).
+        При проверке стенд подписывает токены сам — эндпоинт не участвует в контракте стенда.
       security: []
       requestBody:
         required: true
@@ -467,7 +577,12 @@ paths:
               $ref: '#/components/schemas/DevTokenRequest'
       responses:
         '200':
-          description: Подписанный JWT
+          description: Подписанный JWT (+ Set-Cookie `dev_token`)
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: HttpOnly cookie `dev_token=<jwt>`
           content:
             application/json:
               schema:
@@ -477,13 +592,76 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationError'
 
+  /dev/logout:
+    post:
+      tags: [dev]
+      operationId: logoutDevToken
+      summary: Снять cookie `dev_token` (только разработка)
+      description: Доступен только при `DEV_TOKEN_ENABLED=true`, иначе `404`.
+      security: []
+      responses:
+        '200':
+          description: Cookie удалена
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dev/session:
+    get:
+      tags: [dev]
+      operationId: getDevSession
+      summary: Статус сессии по cookie/Bearer (только разработка)
+      description: |
+        Доступен только при `DEV_TOKEN_ENABLED=true`, иначе `404`.
+        Не бросает `401` при отсутствии токена — возвращает `authenticated: false`.
+      security: []
+      responses:
+        '200':
+          description: Состояние сессии
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authenticated]
+                properties:
+                  authenticated:
+                    type: boolean
+                  sub:
+                    type: string
+                    nullable: true
+                  org_id:
+                    type: string
+                    format: uuid
+                    nullable: true
+                  role:
+                    type: string
+                    enum: [worker, authenticated]
+                    nullable: true
+        '404':
+          $ref: '#/components/responses/NotFound'
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: HS256 JWT, claims `sub`, `org_id`, `role`
+      description: |
+        HS256 JWT, claims `sub`, `org_id`, `role`.
+        Альтернатива — cookie `dev_token` (см. cookieAuth).
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: dev_token
+      description: HttpOnly JWT cookie, выставляется `POST /dev/token` для веб-UI
     webhookSignature:
       type: apiKey
       in: header
@@ -692,6 +870,215 @@ components:
         status:
           type: string
           example: failed
+
+    CallAttemptStatus:
+      type: string
+      enum: [queued, dialing, in_progress, completed, failed, no_answer]
+      description: Статусы попытки по маппингу типов вебхуков ТЗ
+
+    CallAttemptListItem:
+      type: object
+      required: [id, status, phone, campaign_name, created_at]
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/CallAttemptStatus'
+        phone:
+          type: string
+          description: contacts.phone_e164
+        campaign_name:
+          type: string
+        started_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        ended_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+
+    CallAttemptListResponse:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CallAttemptListItem'
+        next_cursor:
+          anyOf:
+            - type: string
+            - type: 'null'
+          description: Курсор следующей страницы; null если страница последняя
+
+    StatusHistorySource:
+      type: string
+      enum: [claim, webhook, abort]
+      description: |
+        `claim` — создание попытки; `webhook` — применённое событие провайдера;
+        `abort` — `POST .../abort` без вебхуков.
+
+    StatusHistoryItem:
+      type: object
+      required: [at, status, source]
+      additionalProperties: false
+      properties:
+        at:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/CallAttemptStatus'
+        source:
+          $ref: '#/components/schemas/StatusHistorySource'
+        event_type:
+          anyOf:
+            - type: string
+            - type: 'null'
+          description: Тип вебхука (`call.dialing` …); null для claim/abort
+        sequence:
+          anyOf:
+            - type: integer
+              format: int64
+            - type: 'null'
+          description: sequence вебхука; null для claim/abort
+
+    CrmDeliveryState:
+      type: string
+      enum: [pending, retrying, delivered]
+      description: |
+        `pending` — в outbox, ещё не было неуспешных попыток;
+        `retrying` — были ошибки, ждём next_attempt_at;
+        `delivered` — delivered_at заполнен.
+
+    CrmDelivery:
+      type: object
+      required: [state, attempts]
+      additionalProperties: false
+      properties:
+        state:
+          $ref: '#/components/schemas/CrmDeliveryState'
+        attempts:
+          type: integer
+          minimum: 0
+          description: Число неуспешных/выполненных попыток доставки из outbox
+        delivered_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        last_error:
+          anyOf:
+            - type: string
+            - type: 'null'
+        next_attempt_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+
+    CallAttemptContact:
+      type: object
+      required: [phone, timezone]
+      additionalProperties: false
+      properties:
+        phone:
+          type: string
+        timezone:
+          type: string
+          description: IANA timezone контакта
+
+    AnalysisSummary:
+      type: object
+      required: [id, status, created_at]
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/AnalysisStatus'
+        result:
+          anyOf:
+            - $ref: '../packages/shared/analysis-result.schema.json'
+            - type: 'null'
+        partial:
+          anyOf:
+            - $ref: '#/components/schemas/PartialAnalysisResult'
+            - type: 'null'
+        error:
+          anyOf:
+            - type: string
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+
+    CallAttemptDetail:
+      type: object
+      required:
+        - id
+        - status
+        - campaign_name
+        - contact
+        - status_history
+        - analyses
+        - created_at
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/CallAttemptStatus'
+        provider_call_id:
+          anyOf:
+            - type: string
+            - type: 'null'
+        campaign_name:
+          type: string
+        contact:
+          $ref: '#/components/schemas/CallAttemptContact'
+        started_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        ended_at:
+          anyOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        outcome:
+          anyOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        transcript:
+          anyOf:
+            - type: string
+            - type: 'null'
+        status_history:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatusHistoryItem'
+        analyses:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalysisSummary'
+        crm:
+          anyOf:
+            - $ref: '#/components/schemas/CrmDelivery'
+            - type: 'null'
+          description: null если терминальный триггер ещё не создал outbox-запись
+        created_at:
+          type: string
+          format: date-time
 
     CreateAnalysisRequest:
       type: object

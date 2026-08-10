@@ -6,20 +6,27 @@ from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
 from app.db import db
-from app.errors import AppError, app_error_handler, http_error_handler, validation_error_handler
+from app.errors import (
+    AppError,
+    app_error_handler,
+    http_error_handler,
+    validation_error_handler,
+)
 from app.logging import get_logger, setup_logging
 from app.middleware import RequestIdMiddleware
 from app.migrations import apply_migrations
-from app.routers import analyses, attempts, dev, rpc, webhooks
+from app.routers import analyses, attempts, call_attempts, dev, rpc, webhooks
 from app.tasks.crm_poller import crm_poller_loop
 from app.tasks.reaper import reaper_loop
 from app.tasks.stream_consumer import analysis_dispatcher_loop
 
 log = get_logger(__name__)
+_settings = get_settings()
 
 
 async def wait_for_db(dsn: str, attempts: int = 60) -> None:
@@ -68,13 +75,23 @@ app = FastAPI(
     title="Call Campaign Service API",
     lifespan=lifespan,
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_settings.web_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_middleware(RequestIdMiddleware)
-app.add_exception_handler(AppError, app_error_handler)
-app.add_exception_handler(StarletteHTTPException, http_error_handler)
-app.add_exception_handler(RequestValidationError, validation_error_handler)
+# Starlette's handler Protocol is typed against bare Exception; our handlers
+# take the concrete exception subclass (standard FastAPI pattern).
+app.add_exception_handler(AppError, app_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(StarletteHTTPException, http_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(RequestValidationError, validation_error_handler)  # type: ignore[arg-type]
 
 app.include_router(rpc.router)
 app.include_router(webhooks.router)
+app.include_router(call_attempts.router)
 app.include_router(attempts.router)
 app.include_router(analyses.router)
 app.include_router(dev.router)

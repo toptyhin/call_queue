@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     crm_url: str = "http://localhost:8090/crm"
     provider_url: str = "http://localhost:8090"
 
+    # Browser origin for CORS + cookie-auth (Vite dev UI).
+    web_origin: str = "http://localhost:5173"
+    # HttpOnly cookie Secure flag — leave false on plain http localhost.
+    cookie_secure: bool = False
+
     dev_token_enabled: bool = True
     migrations_dir: str = "migrations"
 

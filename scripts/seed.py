@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "apps" / "api"))
 
 ORG_ID = UUID("00000000-0000-4000-8000-000000000001")
 CAMPAIGN_ID = UUID("00000000-0000-4000-8000-000000000010")
-CONTACT_ID = UUID("00000000-0000-4000-8000-000000000020")
+CONTACT_ID = UUID("00000000-0000-4000-8000-000000000029")
 ATTEMPT_ID = UUID("00000000-0000-4000-8000-000000000030")
 
 
@@ -81,7 +81,11 @@ async def main() -> None:
                 attempts_count, last_attempt_at, do_not_call
             )
             VALUES ($1, $2, $3, '+79001119999', 'Europe/Moscow', 1, now(), false)
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE
+            SET phone_e164 = EXCLUDED.phone_e164,
+                timezone = EXCLUDED.timezone,
+                attempts_count = EXCLUDED.attempts_count,
+                last_attempt_at = EXCLUDED.last_attempt_at
             """,
             CONTACT_ID,
             ORG_ID,
@@ -93,6 +97,7 @@ async def main() -> None:
             "Менеджер: Могу предложить скидку.\n"
             "Клиент: Пришлите предложение."
         )
+        outcome = {"sip_code": 200, "duration_sec": 120, "transcript": transcript}
         await conn.execute(
             """
             INSERT INTO call_attempts (
@@ -103,18 +108,69 @@ async def main() -> None:
             VALUES (
                 $1, $2, $3, $4, 'call_seed_completed',
                 'completed', now() - interval '10 minutes', now() - interval '5 minutes',
-                $5::jsonb, $6, 3
+                $5::jsonb, $6, 4
             )
             ON CONFLICT (id) DO UPDATE
-            SET transcript = EXCLUDED.transcript, status = 'completed'
+            SET contact_id = EXCLUDED.contact_id,
+                transcript = EXCLUDED.transcript,
+                status = 'completed',
+                outcome = EXCLUDED.outcome,
+                provider_call_id = EXCLUDED.provider_call_id,
+                last_applied_sequence = EXCLUDED.last_applied_sequence
             """,
             ATTEMPT_ID,
             ORG_ID,
             CAMPAIGN_ID,
             CONTACT_ID,
-            orjson.dumps({"sip_code": 200, "duration_sec": 120}).decode(),
+            orjson.dumps(outcome).decode(),
             transcript,
         )
+
+        # Timeline + CRM demo data (INSERT does not fire terminal UPDATE trigger).
+        now = datetime.now(timezone.utc)
+        history = [
+            ("seed_ev_queued", 1, "call.queued", {"attempt_id": str(ATTEMPT_ID)}),
+            ("seed_ev_dialing", 2, "call.dialing", {"attempt_id": str(ATTEMPT_ID)}),
+            ("seed_ev_answered", 3, "call.answered", {"attempt_id": str(ATTEMPT_ID)}),
+            ("seed_ev_completed", 4, "call.completed", outcome),
+        ]
+        for event_id, seq, etype, data in history:
+            payload = {
+                "event_id": event_id,
+                "call_id": "call_seed_completed",
+                "sequence": seq,
+                "type": etype,
+                "occurred_at": now.isoformat().replace("+00:00", "Z"),
+                "data": data,
+            }
+            await conn.execute(
+                """
+                INSERT INTO webhook_events (
+                    provider_event_id, provider_call_id, sequence, type,
+                    payload, applied_at, call_attempt_id
+                )
+                VALUES ($1, 'call_seed_completed', $2, $3, $4::jsonb, now(), $5)
+                ON CONFLICT (provider_event_id) DO NOTHING
+                """,
+                event_id,
+                seq,
+                etype,
+                orjson.dumps(payload).decode(),
+                ATTEMPT_ID,
+            )
+
+        await conn.execute(
+            """
+            INSERT INTO crm_outbox (attempt_id, status, outcome, delivered_at, attempts)
+            SELECT $1, 'completed', $2::jsonb, now(), 1
+            WHERE NOT EXISTS (
+                SELECT 1 FROM crm_outbox WHERE attempt_id = $1
+            )
+            """,
+            ATTEMPT_ID,
+            orjson.dumps(outcome).decode(),
+        )
+
         print(
             orjson.dumps(
                 {

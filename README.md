@@ -57,6 +57,11 @@ Compose также задаёт DSN БД, пароли ролей `app_user` / `
 - Стрим-консюмер к провайдеру, журнал чанков в БД, partial-результат
 - Web UI с `data-state` на контейнере (queued / streaming / reconnecting / done / partial / error / cancelled / idle)
 
+**UI-расширение (сверх ТЗ §7.4)**
+- `GET /api/call_attempts` — список попыток org; клик в UI открывает детали
+- `GET /api/call_attempts/:id` — таймлайн статусов звонка + LLM analyses + CRM outbox
+- `GET /api/call_attempts/stream` — SSE-лента `attempt` / `crm` / `analysis`
+
 ## Сиды
 
 ```bash
@@ -70,18 +75,24 @@ make seed
 При `DEV_TOKEN_ENABLED=true`:
 
 ```bash
-curl -s -X POST http://localhost:8080/dev/token \
+# Выдаёт JWT в теле и ставит HttpOnly cookie `dev_token` (для веб-UI).
+curl -s -c - -X POST http://localhost:8080/dev/token \
   -H 'content-type: application/json' \
-  -d '{"sub":"dev","org_id":"00000000-0000-4000-8000-000000000001","role":"worker"}'
+  -d '{"sub":"dev","org_id":"00000000-0000-4000-8000-000000000001","role":"authenticated"}'
+
+# Статус сессии / снятие cookie
+curl -s -b cookies.txt http://localhost:8080/dev/session
+curl -s -b cookies.txt -c cookies.txt -X POST http://localhost:8080/dev/logout
 ```
 
-Роли: `worker` | `authenticated`.
+Роли: `worker` | `authenticated`. API принимает либо `Authorization: Bearer`, либо cookie `dev_token`. Веб-UI хранит сессию только в cookie (не в `localStorage`).
 
 ## Ручные сценарии
 
 1. **Claim** — после `make seed`: `POST /rpc/claim_next_contact` с JWT и `campaign_id` из сида → контакт + `attempt_id` (или `contact: null`, если очередь пуста / кампания не `active`).
 2. **Webhook** — `POST /webhooks/calls` с валидной `X-Signature: sha256=…` по сырому телу; невалидная подпись → `401`. События до `provider-link` буферизуются (`200`), после линка применяются по `sequence`.
 3. **Analysis stream** — `docker compose --profile dev up -d`, сид, JWT, `POST /api/analyses` с `call_attempt_id` completed-попытки → SSE до `done`; UI на `:5173` показывает `data-state`.
+4. **Calls list UI** — на `:5173` mint token (`authenticated`) → список звонков; клик по строке → таймлайн (`queued`/`dialing`/`in_progress`/терминал), блоки LLM и CRM; live-обновления через `/api/call_attempts/stream`.
 
 ## Нагрузка и SLA
 

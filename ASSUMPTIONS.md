@@ -58,6 +58,7 @@
 
 - Триггер `AFTER UPDATE` на `call_attempts` при переходе в терминальный статус (`completed`/`failed`/`no_answer`): `attempts_count + 1`, `last_attempt_at = ended_at`, `do_not_call` из `outcome`, очистка `contacts.locked_attempt_id`, **и запись в `crm_outbox`** — всё в одной транзакции с обновлением попытки.
 - Уведомление CRM — фоновая asyncio-задача: поллинг `crm_outbox`, `POST CRM_URL` (`httpx`) с телом `{attempt_id, status, outcome}`, ретраи с экспоненциальным бэкоффом (`next_attempt_at`, потолок задержки **5 минут** / 300 с), дедлайн на запрос. Записи outbox **никогда не дропаются** — только откладываются до успешной доставки. Доступность CRM не влияет на приём вебхуков. Идемпотентность на стороне CRM обеспечивается `attempt_id` (естественный ключ).
+- **Чтение outbox веб-UI**: политика RLS `SELECT` для `app_user` через linked `call_attempts` своей org (см. §9a); мутации из API запрещены.
 - **`abort` и `stale_timeout` расходуют попытку**: триггер един для всех терминальных статусов, `attempts_count` инкрементируется, хотя до набора дело могло не дойти. Считаем честным (ресурс контакта был захвачен), но это допущение.
 
 ## 6. Воркер-дозвонщик: роль и жизненный цикл
@@ -68,7 +69,7 @@
 
 ## 7. Доступ и изоляция организаций
 
-- JWT HS256, claims `sub`, `org_id`, `role` (`worker` | `authenticated`). Проверяем подпись и `exp` (если есть). **Выдача токенов за пределами сервиса** — стенд подписывает сам нашим `JWT_SECRET`; для разработки есть `POST /dev/token`, включённый только флагом окружения.
+- JWT HS256, claims `sub`, `org_id`, `role` (`worker` | `authenticated`). Проверяем подпись и `exp` (если есть). Принимаем `Authorization: Bearer` (воркеры) **или** HttpOnly cookie `dev_token` (веб-UI). **Выдача токенов за пределами сервиса** — стенд подписывает сам нашим `JWT_SECRET`; для разработки есть `POST /dev/token` (ставит cookie), `POST /dev/logout`, `GET /dev/session`, включённые только флагом окружения.
 - **Матрица ролей** (дублируется в `x-roles` операций спеки): claim — обе роли; `provider-link`/`abort` — только `worker`; `/api/analyses*` — обе роли. Недопущенная роль → `403 forbidden`; чужая организация → `404` (изоляция ≠ роли).
 - **Машиночитаемые ошибки**: все ошибки API — `{code, detail}`, `code` из enum `ErrorCode` в спеке (`unauthorized`, `token_expired`, `invalid_signature`, `forbidden`, `not_found`, `already_linked`, `not_queued`, `no_transcript`, `attempt_not_completed`, `analysis_terminal`, `validation_error`). Клиенты и стенд опираются на `code`, не на текст.
 - **Изоляция — PostgreSQL RLS**, а не только проверки в коде: приложение работает под non-superuser ролью `app_user`, на всех tenant-таблицах политика `org_id = current_setting('app.org_id')::uuid`, значение ставится `SET LOCAL` из JWT в каждой транзакции. Это закрывает требование «ни напрямую через БД-роль».
@@ -97,8 +98,22 @@
 - **Механика SSE**: первая строка — `retry: 3000`; heartbeat `: ping` каждые 15 с молчания; SSE-поле `id:` несут только `chunk`; подключение к терминальному анализу → replay журнала + терминальное событие и закрытие; дисконнект клиента ≠ отмена; конкурентные подписки разрешены. Спека определяет события `chunk` / `done` / `error`; для `cancelled` наружу уходит `event: error` с `{"code":"cancelled",...}` (отдельного SSE-типа `cancelled` нет).
 - **`partial` — `PartialAnalysisResult`**: форма схемы 7.3 со всеми необязательными полями. Склейка: дельты одного поля конкатенируются как текст; `objections`/`lead_score`/`confidence` стримятся JSON-представлением; поле появляется в `partial`, когда текст парсится.
 - Повторный `POST /api/analyses` на ту же попытку создаёт **новый** разбор (переанализ легитимен); дедупликации по `call_attempt_id` нет.
-- Авторизация SSE: `EventSource` не умеет заголовки, поэтому клиент использует fetch-based SSE (`@microsoft/fetch-event-source`) с `Authorization: Bearer`. Чужая организация на всех `/api/analyses*` → `404` (RLS).
+- Авторизация SSE: `EventSource` не умеет заголовки, поэтому клиент использует fetch-based SSE (`@microsoft/fetch-event-source`) с cookie `dev_token` (`credentials: 'include'`) или `Authorization: Bearer`. Чужая организация на всех `/api/analyses*` → `404` (RLS).
 - **Приоритет UI `data-state`** (сверху вниз): `cancelled` → `error` (пустой partial) → `partial` (error + непустой partial) → `done` → `reconnecting` → `streaming` → `queued`; до старта разбора — `idle`.
+
+## 9a. Веб-UI: список звонков и таймлайн (расширение сверх ТЗ)
+
+ТЗ (§7.4) требует одну страницу запуска разбора и живой просмотр с `data-state`. Дополнительно (не оценивается стендом, но контрактуется в OpenAPI):
+
+- `GET /api/call_attempts` — курсорный список попыток org (`created_at DESC`); роль `authenticated`.
+- `GET /api/call_attempts/{id}` — детали: контакт/кампания, `status_history`, связанные `analyses`, состояние CRM outbox.
+- `GET /api/call_attempts/stream` — org SSE: события `attempt` / `crm` / `analysis` (LISTEN/NOTIFY + re-read под RLS; механика как у analyses: `retry: 3000`, `: ping`).
+
+**История статусов звонка** строится без отдельного журнала: синтетическая точка `queued` (`source=claim` от `call_attempts.created_at`) + применённые `webhook_events` (маппинг типов ТЗ → статусы) + точка `abort`, если попытка `failed` без терминального вебхука.
+
+**CRM в UI**: `crm_outbox` читается `app_user` через RLS-политику `SELECT` по linked attempt (INSERT по-прежнему только SECURITY DEFINER-триггер; поллер — BYPASSRLS). Состояния UI: `pending` / `retrying` / `delivered`.
+
+Атрибут `data-state` остаётся на контейнере разбора и не смешивается со статусами списка звонков.
 
 ## 10. Запуск и окружение
 
