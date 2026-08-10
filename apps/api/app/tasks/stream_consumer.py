@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Literal
 from uuid import UUID
 
 import httpx
@@ -22,6 +22,8 @@ log = structlog.get_logger(__name__)
 
 _wake = asyncio.Event()
 _cancel_flags: dict[UUID, asyncio.Event] = {}
+
+StreamOutcome = Literal["done", "cancelled", "retry", "broken"]
 
 
 def wake_analysis_dispatcher() -> None:
@@ -48,7 +50,7 @@ async def analysis_dispatcher_loop(settings: Settings, stop: asyncio.Event) -> N
 
         try:
             await asyncio.wait_for(_wake.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     for t in list(workers):
@@ -121,16 +123,11 @@ async def _run_one(
         structlog.contextvars.unbind_contextvars("analysis_id")
 
 
-async def _consume_provider(
-    settings: Settings,
+async def _load_saved_buffers(
     analysis_id: UUID,
-    org_id: UUID,
-    transcript: str,
-    cancel_event: asyncio.Event,
-) -> None:
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
     buffers = empty_buffers()
     saved_chunks: list[tuple[str, str]] = []
-    # Load existing chunks (shouldn't exist for fresh queued, but safe)
     assert db.webhook_pool is not None
     async with db.webhook_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -143,7 +140,89 @@ async def _consume_provider(
         for r in rows:
             apply_delta(buffers, r["field"], r["delta"])
             saved_chunks.append((r["field"], r["delta"]))
+    return buffers, saved_chunks
 
+
+async def _iter_sse_frames(
+    resp: httpx.Response,
+) -> AsyncIterator[tuple[str, str]]:
+    event_name: str | None = None
+    data_lines: list[str] = []
+    async for line in resp.aiter_lines():
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].lstrip())
+        elif line == "" and event_name and data_lines:
+            yield event_name, "\n".join(data_lines)
+            event_name = None
+            data_lines = []
+        elif line == "":
+            event_name = None
+            data_lines = []
+
+
+async def _stream_once(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    analysis_id: UUID,
+    transcript: str,
+    buffers: dict[str, str],
+    saved_chunks: list[tuple[str, str]],
+    cancel_event: asyncio.Event,
+    *,
+    attempt: int,
+) -> StreamOutcome:
+    try:
+        async with client.stream(
+            "POST",
+            f"{settings.provider_url.rstrip('/')}/v1/analyze",
+            json={"request_id": str(analysis_id), "transcript": transcript},
+        ) as resp:
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "1"))
+                await asyncio.sleep(max(1, retry_after))
+                return "retry"
+            if resp.status_code != 200:
+                return "broken"
+
+            skip = len(saved_chunks)
+            seen = 0
+            async for event_name, data_raw in _iter_sse_frames(resp):
+                if await _is_cancelled(analysis_id) or cancel_event.is_set():
+                    await _set_cancelled(analysis_id)
+                    return "cancelled"
+                done = await _handle_provider_event(
+                    analysis_id,
+                    event_name,
+                    data_raw,
+                    buffers,
+                    saved_chunks,
+                    skip,
+                    seen,
+                )
+                if event_name == "chunk":
+                    seen += 1
+                if done:
+                    return "done"
+            # Stream ended without done → retry with backoff
+            log.warning("stream_consumer.broken", attempt=attempt)
+            return "broken"
+    except httpx.HTTPError:
+        log.warning("stream_consumer.http_error", attempt=attempt, exc_info=True)
+        return "broken"
+
+
+async def _consume_provider(
+    settings: Settings,
+    analysis_id: UUID,
+    org_id: UUID,
+    transcript: str,
+    cancel_event: asyncio.Event,
+) -> None:
+    # org_id kept for call-site symmetry with claim/dispatcher; provider URL is global.
+    _ = org_id
+    buffers, saved_chunks = await _load_saved_buffers(analysis_id)
     max_attempts = 5
     attempt = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
@@ -153,67 +232,95 @@ async def _consume_provider(
                 return
 
             attempt += 1
-            try:
-                async with client.stream(
-                    "POST",
-                    f"{settings.provider_url.rstrip('/')}/v1/analyze",
-                    json={"request_id": str(analysis_id), "transcript": transcript},
-                ) as resp:
-                    if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", "1"))
-                        await asyncio.sleep(max(1, retry_after))
-                        continue
-                    if resp.status_code != 200:
-                        await asyncio.sleep(min(8, 2**attempt))
-                        continue
+            outcome = await _stream_once(
+                client,
+                settings,
+                analysis_id,
+                transcript,
+                buffers,
+                saved_chunks,
+                cancel_event,
+                attempt=attempt,
+            )
+            if outcome in ("done", "cancelled"):
+                return
+            if outcome == "retry":
+                continue
+            await asyncio.sleep(min(8, 2**attempt))
 
-                    skip = len(saved_chunks)
-                    seen = 0
-                    event_name: str | None = None
-                    data_lines: list[str] = []
+    await _set_error(
+        analysis_id, "provider stream broken, retries exhausted", keep_partial=True
+    )
 
-                    async for line in resp.aiter_lines():
-                        if await _is_cancelled(analysis_id) or cancel_event.is_set():
-                            await _set_cancelled(analysis_id)
-                            return
 
-                        if line.startswith("event:"):
-                            event_name = line.split(":", 1)[1].strip()
-                        elif line.startswith("data:"):
-                            data_lines.append(line.split(":", 1)[1].lstrip())
-                        elif line == "":
-                            if event_name and data_lines:
-                                data_raw = "\n".join(data_lines)
-                                done = await _handle_provider_event(
-                                    analysis_id,
-                                    org_id,
-                                    event_name,
-                                    data_raw,
-                                    buffers,
-                                    saved_chunks,
-                                    skip,
-                                    seen,
-                                )
-                                if event_name == "chunk":
-                                    seen += 1
-                                if done:
-                                    return
-                            event_name = None
-                            data_lines = []
+async def _persist_chunk(
+    analysis_id: UUID,
+    buffers: dict[str, str],
+    saved_chunks: list[tuple[str, str]],
+    field: str,
+    delta: str,
+) -> None:
+    apply_delta(buffers, field, delta)
+    saved_chunks.append((field, delta))
+    seq = len(saved_chunks)
+    partial = buffers_to_partial(buffers)
+    assert db.webhook_pool is not None
+    async with db.webhook_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO analysis_chunks (analysis_id, seq, field, delta)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (analysis_id, seq) DO NOTHING
+                """,
+                analysis_id,
+                seq,
+                field,
+                delta,
+            )
+            await conn.execute(
+                """
+                UPDATE analyses
+                SET partial = $2::jsonb, updated_at = now()
+                WHERE id = $1 AND status = 'streaming'
+                """,
+                analysis_id,
+                orjson.dumps(partial).decode(),
+            )
 
-                    # Stream ended without done → retry with backoff
-                    log.warning("stream_consumer.broken", attempt=attempt)
-                    await asyncio.sleep(min(8, 2**attempt))
-            except httpx.HTTPError:
-                log.warning("stream_consumer.http_error", attempt=attempt, exc_info=True)
-                await asyncio.sleep(min(8, 2**attempt))
 
-    await _set_error(analysis_id, "provider stream broken, retries exhausted", keep_partial=True)
+async def _complete_analysis(
+    analysis_id: UUID,
+    buffers: dict[str, str],
+    result: object,
+) -> None:
+    try:
+        validated = AnalysisResult.model_validate(result)
+        assert db.webhook_pool is not None
+        async with db.webhook_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE analyses
+                SET status = 'done',
+                    result = $2::jsonb,
+                    partial = $3::jsonb,
+                    updated_at = now()
+                WHERE id = $1 AND status = 'streaming'
+                """,
+                analysis_id,
+                validated.model_dump_json(),
+                orjson.dumps(buffers_to_partial(buffers)).decode(),
+            )
+    except Exception as exc:  # noqa: BLE001
+        await _set_error(
+            analysis_id,
+            f"invalid provider result: {exc}",
+            keep_partial=True,
+        )
 
 
 async def _handle_provider_event(
     analysis_id: UUID,
-    org_id: UUID,
     event_name: str,
     data_raw: str,
     buffers: dict[str, str],
@@ -232,9 +339,7 @@ async def _handle_provider_event(
         delta = data.get("delta")
         if not isinstance(field, str) or not isinstance(delta, str):
             return False
-
         if seen < skip:
-            # Prefix verification
             exp_field, exp_delta = saved_chunks[seen]
             if field != exp_field or delta != exp_delta:
                 await _set_error(
@@ -244,61 +349,11 @@ async def _handle_provider_event(
                 )
                 return True
             return False
-
-        apply_delta(buffers, field, delta)
-        saved_chunks.append((field, delta))
-        seq = len(saved_chunks)
-        partial = buffers_to_partial(buffers)
-        assert db.webhook_pool is not None
-        async with db.webhook_pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    INSERT INTO analysis_chunks (analysis_id, seq, field, delta)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (analysis_id, seq) DO NOTHING
-                    """,
-                    analysis_id,
-                    seq,
-                    field,
-                    delta,
-                )
-                await conn.execute(
-                    """
-                    UPDATE analyses
-                    SET partial = $2::jsonb, updated_at = now()
-                    WHERE id = $1 AND status = 'streaming'
-                    """,
-                    analysis_id,
-                    orjson.dumps(partial).decode(),
-                )
+        await _persist_chunk(analysis_id, buffers, saved_chunks, field, delta)
         return False
 
     if event_name == "done":
-        result = data.get("result")
-        try:
-            validated = AnalysisResult.model_validate(result)
-            assert db.webhook_pool is not None
-            async with db.webhook_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE analyses
-                    SET status = 'done',
-                        result = $2::jsonb,
-                        partial = $3::jsonb,
-                        updated_at = now()
-                    WHERE id = $1 AND status = 'streaming'
-                    """,
-                    analysis_id,
-                    validated.model_dump_json(),
-                    orjson.dumps(buffers_to_partial(buffers)).decode(),
-                )
-        except Exception as exc:  # noqa: BLE001
-            await _set_error(
-                analysis_id,
-                f"invalid provider result: {exc}",
-                keep_partial=True,
-            )
+        await _complete_analysis(analysis_id, buffers, data.get("result"))
         return True
 
     return False
@@ -330,6 +385,8 @@ async def _set_cancelled(analysis_id: UUID) -> None:
 
 
 async def _set_error(analysis_id: UUID, message: str, *, keep_partial: bool) -> None:
+    # keep_partial documents caller intent; SQL leaves existing partial untouched.
+    _ = keep_partial
     assert db.webhook_pool is not None
     async with db.webhook_pool.acquire() as conn:
         await conn.execute(

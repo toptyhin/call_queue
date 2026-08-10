@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 import orjson
@@ -24,42 +25,65 @@ def apply_delta(buffers: dict[str, str], field: str, delta: str) -> None:
     buffers[field] += delta
 
 
+def _parse_summary(raw: str) -> str | None:
+    return raw or None
+
+
+def _parse_objections(raw: str) -> list[str] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+        return parsed
+    return None
+
+
+def _parse_next_step(raw: str) -> str | None:
+    return raw if raw in NEXT_STEPS else None
+
+
+def _parse_int_range(raw: str, lo: int, hi: int) -> int | None:
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(val, int) and lo <= val <= hi:
+        return val
+    return None
+
+
+def _parse_confidence(raw: str) -> float | None:
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(val, (int, float)) and 0 <= float(val) <= 1:
+        return float(val)
+    return None
+
+
+_PARSERS: dict[str, Callable[[str], Any | None]] = {
+    "summary": _parse_summary,
+    "objections": _parse_objections,
+    "next_step": _parse_next_step,
+    "lead_score": lambda r: _parse_int_range(r, 0, 100),
+    "confidence": _parse_confidence,
+}
+
+
 def buffers_to_partial(buffers: dict[str, str]) -> dict[str, Any]:
     partial: dict[str, Any] = {}
-    if buffers.get("summary"):
-        partial["summary"] = buffers["summary"]
-
-    raw_obj = buffers.get("objections", "")
-    if raw_obj:
-        try:
-            parsed = json.loads(raw_obj)
-            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                partial["objections"] = parsed
-        except json.JSONDecodeError:
-            pass
-
-    raw_ns = buffers.get("next_step", "")
-    if raw_ns in NEXT_STEPS:
-        partial["next_step"] = raw_ns
-
-    raw_ls = buffers.get("lead_score", "")
-    if raw_ls:
-        try:
-            val = json.loads(raw_ls)
-            if isinstance(val, int) and 0 <= val <= 100:
-                partial["lead_score"] = val
-        except json.JSONDecodeError:
-            pass
-
-    raw_cf = buffers.get("confidence", "")
-    if raw_cf:
-        try:
-            val = json.loads(raw_cf)
-            if isinstance(val, (int, float)) and 0 <= float(val) <= 1:
-                partial["confidence"] = float(val)
-        except json.JSONDecodeError:
-            pass
-
+    for field, parse in _PARSERS.items():
+        val = parse(buffers.get(field, ""))
+        if val is not None:
+            partial[field] = val
     return partial
 
 
