@@ -1,4 +1,4 @@
-.PHONY: up down logs seed codegen test lint typecheck load-seed load-claim load-webhook
+.PHONY: up down logs seed codegen test lint typecheck load-seed load-claim load-webhook e2e-flow
 
 up:
 	docker compose up -d --build
@@ -46,3 +46,9 @@ load-claim:
 load-webhook:
 	WEBHOOK_SECRET=$${WEBHOOK_SECRET:-dev-webhook-secret} \
 		uv run --project apps/api python scripts/load_webhook.py --rps 50 --seconds 60
+
+e2e-flow:
+	WEBHOOK_SECRET=$${WEBHOOK_SECRET:-dev-webhook-secret} \
+	JWT_SECRET=$${JWT_SECRET:-dev-jwt-secret-change-me-32bytes!!} \
+	DATABASE_URL=$${DATABASE_URL:-postgresql://postgres:postgres@localhost:54329/postgres} \
+		uv run --project apps/api python scripts/e2e_flow.py

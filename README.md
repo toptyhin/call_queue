@@ -93,6 +93,13 @@ curl -s -b cookies.txt -c cookies.txt -X POST http://localhost:8080/dev/logout
 2. **Webhook** — `POST /webhooks/calls` с валидной `X-Signature: sha256=…` по сырому телу; невалидная подпись → `401`. События до `provider-link` буферизуются (`200`), после линка применяются по `sequence`.
 3. **Analysis stream** — `docker compose --profile dev up -d`, сид, JWT, `POST /api/analyses` с `call_attempt_id` completed-попытки → SSE до `done`; UI на `:5173` показывает `data-state`.
 4. **Calls list UI** — на `:5173` mint token (`authenticated`) → список звонков; клик по строке → таймлайн (`queued`/`dialing`/`in_progress`/терминал), блоки LLM и CRM; live-обновления через `/api/call_attempts/stream`.
+5. **E2E flow** — полный прогон контакт → телефония (в т.ч. буфер/дедуп/out-of-order/401) → CRM-ретраи → LLM (`CHAOS_429` / `CHAOS_BREAK` / `CHAOS_INVALID` / cancel):
+
+```bash
+docker compose --profile dev up -d --build
+make seed
+make e2e-flow          # ~1–2 мин, exit ≠ 0 при любом FAIL
+```
 
 ## Нагрузка и SLA
 
