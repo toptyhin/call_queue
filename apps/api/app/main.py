@@ -14,9 +14,10 @@ from app.errors import AppError, app_error_handler, http_error_handler, validati
 from app.logging import get_logger, setup_logging
 from app.middleware import RequestIdMiddleware
 from app.migrations import apply_migrations
-from app.routers import attempts, dev, rpc, webhooks
+from app.routers import analyses, attempts, dev, rpc, webhooks
 from app.tasks.crm_poller import crm_poller_loop
 from app.tasks.reaper import reaper_loop
+from app.tasks.stream_consumer import analysis_dispatcher_loop
 
 log = get_logger(__name__)
 
@@ -47,6 +48,9 @@ async def lifespan(_app: FastAPI):
     bg_tasks = [
         asyncio.create_task(crm_poller_loop(settings, stop), name="crm_poller"),
         asyncio.create_task(reaper_loop(settings, stop), name="reaper"),
+        asyncio.create_task(
+            analysis_dispatcher_loop(settings, stop), name="analysis_dispatcher"
+        ),
     ]
 
     log.info("startup.ready")
@@ -72,6 +76,7 @@ app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.include_router(rpc.router)
 app.include_router(webhooks.router)
 app.include_router(attempts.router)
+app.include_router(analyses.router)
 app.include_router(dev.router)
 
 
