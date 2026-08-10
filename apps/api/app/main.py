@@ -15,6 +15,8 @@ from app.logging import get_logger, setup_logging
 from app.middleware import RequestIdMiddleware
 from app.migrations import apply_migrations
 from app.routers import attempts, dev, rpc, webhooks
+from app.tasks.crm_poller import crm_poller_loop
+from app.tasks.reaper import reaper_loop
 
 log = get_logger(__name__)
 
@@ -41,9 +43,19 @@ async def lifespan(_app: FastAPI):
     await apply_migrations(settings)
     await db.connect(settings)
 
+    stop = asyncio.Event()
+    bg_tasks = [
+        asyncio.create_task(crm_poller_loop(settings, stop), name="crm_poller"),
+        asyncio.create_task(reaper_loop(settings, stop), name="reaper"),
+    ]
+
     log.info("startup.ready")
     yield
 
+    stop.set()
+    for task in bg_tasks:
+        task.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
     await db.disconnect()
     log.info("shutdown.complete")
 
