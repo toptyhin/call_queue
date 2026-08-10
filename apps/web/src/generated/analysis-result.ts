@@ -21,6 +21,6 @@ export const AnalysisResultSchema = z.object({
 
 export type AnalysisResult = z.infer<typeof AnalysisResultSchema>
 
-export const PartialAnalysisResultSchema = AnalysisResultSchema.partial()
+const PartialAnalysisResultSchema = AnalysisResultSchema.partial()
 
 export type PartialAnalysisResult = z.infer<typeof PartialAnalysisResultSchema>

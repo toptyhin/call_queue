@@ -1,0 +1,18 @@
+# pnpm settings (single-package project; packages field omitted → root only).
+# Delay installs of brand-new releases (minutes) so malware can be yanked.
+# 10080 = 7 days (react-doctor recommendation). Exclude patterns cover
+# toolchain packages currently younger than the cutoff in this lockfile.
+minimumReleaseAge: 10080
+minimumReleaseAgeExclude:
+  - oxlint
+  - '@oxlint/*'
+  - '@oxc-project/*'
+  - vite
+  - '@vitejs/*'
+  - rolldown
+  - '@rolldown/*'
+  - oxc-parser
+  - nanoid
+  - postcss
+# Reject updates that weaken package trust signals (provenance / signatures).
+trustPolicy: no-downgrade
