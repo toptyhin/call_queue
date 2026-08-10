@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+log = structlog.get_logger(__name__)
 
 
 class AppError(Exception):
@@ -19,10 +22,17 @@ def error_body(code: str, detail: Any) -> dict[str, Any]:
     return {"code": code, "detail": detail}
 
 
+def _client_detail(detail: Any) -> str:
+    """Keep API error bodies short; never dump structured exception payloads."""
+    if isinstance(detail, str):
+        return detail
+    return "request failed"
+
+
 async def app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
-        content=error_body(exc.code, exc.detail),
+        content=error_body(exc.code, _client_detail(exc.detail)),
     )
 
 
@@ -40,14 +50,15 @@ async def http_error_handler(_request: Request, exc: HTTPException) -> JSONRespo
         code = "validation_error"
     return JSONResponse(
         status_code=exc.status_code,
-        content=error_body(code, detail if isinstance(detail, (str, list)) else str(detail)),
+        content=error_body(code, _client_detail(detail)),
     )
 
 
 async def validation_error_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    log.warning("request.validation_error", errors=exc.errors())
     return JSONResponse(
         status_code=422,
-        content=error_body("validation_error", exc.errors()),
+        content=error_body("validation_error", "invalid request"),
     )

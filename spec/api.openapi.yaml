@@ -30,7 +30,8 @@ info:
     - `404` — `not_found`: ресурс не найден **или принадлежит другой организации**.
     - `409` — конфликт жизненного цикла: `already_linked`, `not_queued`,
       `no_transcript`, `attempt_not_completed`, `analysis_terminal`.
-    - `422` — `validation_error` (тело не прошло схему; `detail` — массив ошибок FastAPI).
+    - `422` — `validation_error` (тело/query не прошли схему; `detail` — короткое
+      сообщение, без дампа внутренних ошибок валидации; детали — в логах API).
 
     ## Идемпотентность и ретраи
     | Операция | Ретрай безопасен | Естественный ключ / поведение |
@@ -743,12 +744,10 @@ components:
         code:
           $ref: '#/components/schemas/ErrorCode'
         detail:
-          oneOf:
-            - type: string
-            - type: array
-              items:
-                type: object
-              description: массив ошибок FastAPI при code=validation_error
+          type: string
+          description: >
+            Короткое человекочитаемое сообщение. Клиенты опираются на `code`;
+            внутренние детали валидации/исключений в ответ не включаются.
 
     ClaimNextContactRequest:
       type: object

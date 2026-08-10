@@ -123,7 +123,8 @@ async def receive_call_webhook(
         payload = orjson.loads(raw)
         event = WebhookEventIn.model_validate(payload)
     except Exception as exc:  # noqa: BLE001
-        raise AppError(422, "validation_error", str(exc)) from exc
+        log.warning("webhook.invalid_payload", error=str(exc))
+        raise AppError(422, "validation_error", "invalid webhook payload") from exc
 
     structlog.contextvars.bind_contextvars(
         provider_event_id=event.event_id,

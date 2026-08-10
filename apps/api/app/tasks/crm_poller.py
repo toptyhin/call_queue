@@ -68,9 +68,12 @@ async def _poll_once(
                         outbox_id=str(row["id"]),
                     )
                     return
-                err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                # Persist a short code for the UI; body text stays in logs.
+                err = f"HTTP {resp.status_code}"
+                detail = resp.text[:200]
             except Exception as exc:  # noqa: BLE001
-                err = str(exc)
+                err = "crm request failed"
+                detail = str(exc)
 
             attempts = int(row["attempts"]) + 1
             delay = min(300.0, backoff_base**attempts)
@@ -91,4 +94,5 @@ async def _poll_once(
                 attempt_id=str(row["attempt_id"]),
                 attempts=attempts,
                 error=err,
+                detail=detail,
             )

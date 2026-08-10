@@ -312,9 +312,11 @@ async def _complete_analysis(
                 orjson.dumps(buffers_to_partial(buffers)).decode(),
             )
     except Exception as exc:  # noqa: BLE001
+        # Client-facing error stays short; Pydantic/exc details go to logs only.
+        log.warning("stream_consumer.invalid_result", error=str(exc))
         await _set_error(
             analysis_id,
-            f"invalid provider result: {exc}",
+            "invalid provider result",
             keep_partial=True,
         )
 
