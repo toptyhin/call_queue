@@ -19,6 +19,7 @@
 | Cursor + Grok 4.5 (агент) | `scripts/e2e_flow.py` + CRM-мок `__fail_n`/`/_chaos`; перенос бейджа `data-state` в карточку; дружелюбные 409 разбора |
 | Cursor + Grok 4.5 (агент) | Санитизация клиентских ошибок: без дампа Pydantic/HTTP-тел на фронт |
 | Cursor + Grok 4.5 (агент) | UI: не предлагать «Запустить разбор», если у попытки уже есть `done` |
+| Cursor + Grok 4.5 (агент) | Устойчивость SSE: listener/notify error handling, retry LISTEN, тесты |
 
 ## 2. Принято без правок
 
@@ -60,6 +61,7 @@
     - Сплит `App.tsx` → `DevTokenForm` / `AnalysisPanel` / `AnalysisResultView` + хук `useAnalysisStream`; `CallsPanel` без пропса `token`.
     - `apps/web/pnpm-workspace.yaml` — `minimumReleaseAge: 10080` + `trustPolicy: no-downgrade` (+ excludes для свежих toolchain-пакетов в lockfile, иначе `pnpm install` падает).
     - generated placeholder: снят `export` у неиспользуемого `PartialAnalysisResultSchema`.
+- **SSE resilience** (`apps/api/app/sse.py`) — план medium: `_notify_sink` (не бросает из asyncpg callback, `Queue(maxsize=1000)`), логи `sse.notify_bad_payload` / `org_mismatch`, изоляция `_RETRIABLE` при apply одного notify в org-ленте, retry/backoff LISTEN-сессии с сохранением `last_seq`. Контракт кадров/фронт/SQL-триггеры не трогали. Роутеры остались на тех же публичных генераторах.
 
 ## 4. Написано / решено вручную (в диалоге с агентом)
 
@@ -70,7 +72,7 @@
 
 ## 5. Как проверялось
 
-- `make test` — 9 pytest-тестов ядра в `test_core.py` (healthz, claim/lock, foreign campaign 404, webhook signature/dedup/buffer/link, terminal+outbox, sequence/terminal guards, abort/provider-link) плюс тесты анализов (`test_analyses.py`), read-API (`test_call_attempts.py`: list/cursor, фильтры status/phone/created_range + cursor+filters, 422 на мусор, detail/history/crm, RLS isolation, роли) и cookie-auth (`test_dev_cookie_auth.py`: Set-Cookie/session/logout). После фильтров списка: `test_call_attempts.py` — 14 passed.
+- `make test` — 9 pytest-тестов ядра в `test_core.py` (healthz, claim/lock, foreign campaign 404, webhook signature/dedup/buffer/link, terminal+outbox, sequence/terminal guards, abort/provider-link) плюс тесты анализов (`test_analyses.py`), read-API (`test_call_attempts.py`: list/cursor, фильтры status/phone/created_range + cursor+filters, 422 на мусор, detail/history/crm, RLS isolation, роли) и cookie-auth (`test_dev_cookie_auth.py`: Set-Cookie/session/logout). После фильтров списка: `test_call_attempts.py` — 14 passed. SSE resilience: `tests/test_sse_resilience.py` — 9 passed (parse/uuid, QueueFull listener, analysis retry после `PostgresConnectionError`, изоляция apply в call_attempts feed).
 - `uv run ruff check .` / `uv run mypy` в `apps/api` — чисто; после Zen/Complexity-рефакторинга `uvx python-doctor apps/api` → **100/100** (все категории ✓, включая Zen 15/15 и Complexity 15/15).
 - `docker compose up -d` → `GET /healthz` → `200`.
 - E2E разбора против моков: create → SSE → `done`; число вызовов мок-провайдера = 1 (генерация не перезапускается при reconnect клиента).
