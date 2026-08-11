@@ -20,6 +20,7 @@
 | Cursor + Grok 4.5 (агент) | Санитизация клиентских ошибок: без дампа Pydantic/HTTP-тел на фронт |
 | Cursor + Grok 4.5 (агент) | UI: не предлагать «Запустить разбор», если у попытки уже есть `done` |
 | Cursor + Grok 4.5 (агент) | Устойчивость SSE: listener/notify error handling, retry LISTEN, тесты |
+| Cursor + Grok 4.5 (агент) | Рефакторинг `CallsPanel`: хук, фильтры, список, карточка деталей |
 
 ## 2. Принято без правок
 
@@ -62,6 +63,7 @@
     - `apps/web/pnpm-workspace.yaml` — `minimumReleaseAge: 10080` + `trustPolicy: no-downgrade` (+ excludes для свежих toolchain-пакетов в lockfile, иначе `pnpm install` падает).
     - generated placeholder: снят `export` у неиспользуемого `PartialAnalysisResultSchema`.
 - **SSE resilience** (`apps/api/app/sse.py`) — план medium: `_notify_sink` (не бросает из asyncpg callback, `Queue(maxsize=1000)`), логи `sse.notify_bad_payload` / `org_mismatch`, изоляция `_RETRIABLE` при apply одного notify в org-ленте, retry/backoff LISTEN-сессии с сохранением `last_seq`. Контракт кадров/фронт/SQL-триггеры не трогали. Роутеры остались на тех же публичных генераторах.
+- **Сплит `CallsPanel`** — монолит вынесен в `useCallsPanel` + `callsPanelShared` + `CallsPanelFilters` / `CallsAttemptList` / `CallDetailView`; оболочка `CallsPanel.tsx` только собирает UI. Поведение списка/ленты/разбора не менялось; `App.tsx` не трогали.
 
 ## 4. Написано / решено вручную (в диалоге с агентом)
 
